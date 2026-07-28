@@ -90,6 +90,8 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |
 | `explosion` | `{ position, radius, damage }` | any |
 | `resize` | `{ width, height }` | engine |
+| `ui:quality` | `{ quality }` | ui |
+| ↳ | announced *after* `config.setQuality()` has already rewritten `config.q`. A listener re-reads `ctx.config.q` and applies what it can honour live; it must not assume the change is safe to apply, only that the numbers moved. See "Runtime quality changes". | |
 
 If you need an event that is not listed, add a row here in the same commit.
 
@@ -112,7 +114,20 @@ r.requestEnvMap()     // PMREM env map currently in use
 r.screenSize          // { width, height } of the internal render target
 r.depthTexture        // linear depth, for soft particles / SSR
 r.velocityTexture     // motion vectors, for TAA / motion blur
+r.setHurt(d,b,f,beat) // screen-space hurt state, 0..1 each, into the composite
+r.setQuality(name)    // apply a preset to the LIVE pipeline; returns what was
+                      // applied and what still needs a page reload
+r.setRenderScale(s)   // internal-resolution scale; forces the reallocation
+r.dynres              // dynamic-resolution state (?dynres=0 to disable)
 ```
+
+`setHurt(desaturation, bloodVignette, hitFlash, heartbeat)` is what `ui` calls
+every frame instead of stacking DOM layers over the canvas. A full-screen
+`backdrop-filter`, `mix-blend-mode` or SVG `filter` over the canvas cannot be
+cached in a composited layer — its input redraws every frame — so the browser
+reads back the framebuffer and reruns the filter graph on every one. Anything
+that wants to tint, desaturate or vignette the whole frame belongs in the
+composite, not in the HUD. All four at zero is bit-identical to no effect.
 
 Anything drawn into `viewScene` is composited after the world with a cleared
 depth buffer.
@@ -146,6 +161,51 @@ visible count constant. Two ways, both pixel-exact:
 
 A light whose colour × intensity is exactly 0 adds a float `0.0` to the
 irradiance accumulator, so extra lit slots cannot move a pixel.
+
+### Runtime quality changes
+
+`ui:quality` is a **broadcast, not a command**. The pause menu writes
+`config.q` and announces it; every subsystem that can honour a field live
+subscribes and re-reads what it owns. Four do today — `render`, `sky`,
+`physics`, `audio` — and the rule for what may go in that list is the same one
+the point-light note above is about:
+
+> **A preset field is hot only if changing it changes no shader define.**
+
+Hot, and applied the moment the button is pressed: internal `renderScale`,
+`dprCap`, `shadowMapSize`, `shadowDistance`, the entire screen-space effect set
+(GTAO / SSR / TAA / motion blur / DOF / contact shadows / bloom — their
+material-side terms are gated by the `owFeat` **uniform**, so switching them off
+costs nothing and switching them on costs only that effect's own passes), the
+prepass attachment set, the volumetric march, the rigid-body substep budget and
+the panner model.
+
+Reload-only, and **reported** by `render.setQuality()` rather than silently
+dropped: the cascade COUNT (`OW_CASCADES` is a define in the material-patch
+chunk *and* in the sky's volumetric march), the shadow tap tier
+(`OW_PCF_TAPS` / `OW_PCSS`), `lightSlots`, and everything a subsystem bakes into
+geometry, textures or the fixed step at boot — `textureScale`,
+`simpleMaterials`, `propDensity`, `drawDistance`, `physicsHz`, the particle and
+decal budgets, `anisotropy`. `RenderSystem` therefore keeps two tiers: `qLevel`
+follows the live preset and gates which effect OBJECTS exist, while
+`shaderTier` is frozen at boot and gates what is compiled INTO a lit material.
+
+Because of that split, `CascadedShadowMaps` must be **mutated, never replaced**
+(`csm.setMapSize()`): `MaterialPatcher` and `sky/volumetrics.js` both spread
+`csm.uniforms` into their own uniform sets *by reference*, so handing out a new
+instance leaves both of them sampling a disposed texture.
+
+### Dynamic resolution
+
+`render.dynres` walks `renderScale` down a quantised ladder
+(0.5 / 0.6 / 0.7 / 0.85 / 1.0) on an EMA of the unscaled frame time, with a
+30-frame hysteresis window. The preset's own `renderScale` truncates the top of
+the ladder: it is a **ceiling**, never a target to climb past, so the scaler is
+invisible — and bit-identical to not existing — on a machine that is keeping up.
+Quantised and hysteretic because every step reallocates the whole HDR chain.
+
+**It is off under `config.deterministic`**, unconditionally. A scaler that
+reallocated mid-shot would make every A/B pixel gate in this repo meaningless.
 
 ### Pre-warm
 

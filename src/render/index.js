@@ -17,13 +17,31 @@ import { createComposite, createFxaa, createDebug, createViewComposite } from '.
 import { buildFallbackEnvironment } from './env.js';
 import { RenderProbeScene } from './probe.js';
 
-const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
+/**
+ * Ordinal quality tier, used for the effects that are not a single preset flag
+ * (contact shadows, DOF, bloom levels, viewmodel MSAA, cascade tap counts).
+ *
+ * `mobile` is -1, i.e. BELOW low, not equal to it: every `>= 1` gate below
+ * already excludes it, and the negative value is what `csmShaderChunk` keys its
+ * 4-tap PCF kernel off. An unknown preset name still falls back to 3 (ultra),
+ * so a typo degrades to "too expensive", never to "silently broken".
+ */
+const QUALITY_LEVEL = { mobile: -1, low: 0, medium: 1, high: 2, ultra: 3 };
 
 /**
  * Registration range at or below which a punctual light counts as a room/street
  * PRACTICAL rather than as an effect flash. See `settings.practicalGain`.
  */
 const PRACTICAL_RANGE = 30;
+
+/**
+ * Rungs of the dynamic-resolution ladder, ascending. Quantised on purpose: a
+ * continuous controller would reallocate the entire HDR chain (8 render targets
+ * plus the gbuffer, the AO history, the bloom pyramid...) on almost every frame,
+ * which costs far more than the pixels it saves. Five rungs, and the preset's
+ * own `renderScale` truncates the top of the list — see `_initDynRes`.
+ */
+const DYNRES_STEPS = [0.5, 0.6, 0.7, 0.85, 1.0];
 
 // Full-daylight key intensity (SUN_ILLUMINANCE_TOP through a clear atmosphere).
 // Only used to normalise the viewmodel rig, never to light anything.
@@ -71,12 +89,17 @@ const REF_DAYLIGHT = 4.6;
  *   r.renderer                THREE.WebGLRenderer (do not change state mid-frame)
  *   r.screenSize              { width, height } of the internal HDR target
  *   r.displaySize             { width, height } of the canvas backbuffer
- *   r.depthTexture            R32F linear view depth in METRES (positive)
- *   r.velocityTexture         RG16F screen-space velocity as a UV delta
+ *   r.depthTexture            R32F linear view depth in METRES (positive).
+ *                             Always present.
+ *   r.velocityTexture         RG16F screen-space velocity as a UV delta, or
+ *                             NULL when no enabled effect consumes it (the
+ *                             `low` preset: no TAA, no motion blur, no
+ *                             volumetrics). Test before you sample it.
  *   r.normalTexture           RGBA16F oct-encoded VIEW normal (xy), coverage (z:
  *                             1 = static geometry, 0.7 = skinned/morphed, 0 =
  *                             nothing; test against 0.5 for "is there a
- *                             surface"), material id (w)
+ *                             surface"), material id (w). NULL at `low` for the
+ *                             same reason as velocity.
  *   r.aoTexture               R16F GTAO visibility, or null
  *   r.exposureTexture         1x1 float, .r = exposure scalar, .g = EV100
  *   r.hdrTexture              the pre-post HDR colour target
@@ -91,6 +114,13 @@ const REF_DAYLIGHT = 4.6;
  *   r.patchMaterials(root)    force-inject shadows/AO/SSR into new materials
  *                             (happens automatically within a frame anyway)
  *   r.setExposureBias(ev)     +1 EV = one stop darker
+ *   r.setQuality(name)        apply a preset to the LIVE pipeline. Returns what
+ *                             was applied and what still needs a page reload;
+ *                             also the `ui:quality` listener. See the method.
+ *   r.setRenderScale(s)       internal-resolution scale, forces the realloc
+ *   r.dynres                  dynamic-resolution state (ladder, EMA, hysteresis)
+ *                             `render.dynres.enabled = false` or `?dynres=0`
+ *                             turns it off; always off under `deterministic`
  *   r.settings                live tuning: bloomStrength, bloomThreshold,
  *                             bloomKnee, vignette, adsVignette, grain,
  *                             chromatic, sharpen, shutter, aoRadius,
@@ -131,6 +161,14 @@ export class RenderSystem {
     const q = cfg.q;
     this.q = q;
     this.qLevel = QUALITY_LEVEL[cfg.quality] ?? 3;
+    /**
+     * The quality tier the *lit-material shader chunk* was generated at, frozen
+     * for the session. `qLevel` follows the live preset and gates which effect
+     * OBJECTS exist; `shaderTier` gates PCF/PCSS tap counts inside every lit
+     * material, and moving it would re-key `MaterialPatcher` and recompile all
+     * ~170 of them mid-frame. See `setQuality()`.
+     */
+    this.shaderTier = this.qLevel;
     this.rng = ctx.rng.fork();
     this.frame = 0;
 
@@ -139,7 +177,13 @@ export class RenderSystem {
       canvas: ctx.canvas,
       antialias: false, // TAA/FXAA handle this; MSAA cannot resolve HDR post
       alpha: false,
-      depth: true,
+      // The backbuffer's depth attachment is never used: every depth-tested draw
+      // in the engine goes into `hdrRt` or `viewRt`, and the only things ever
+      // drawn to the canvas are the composite and FXAA full-screen triangles,
+      // both with depthTest and depthWrite off. Asking for one allocated a
+      // full-resolution depth surface (and on many mobile drivers forced the
+      // backbuffer into a slower configuration) for nothing.
+      depth: false,
       stencil: false,
       premultipliedAlpha: false,
       preserveDrawingBuffer: false,
@@ -148,6 +192,18 @@ export class RenderSystem {
     });
     if (!renderer.capabilities.isWebGL2) {
       throw new Error('[render] WebGL2 is required');
+    }
+    // WebGL2 guarantees you can *sample* a float texture; it does NOT guarantee
+    // you can RENDER to one. That takes EXT_color_buffer_float, which a handful
+    // of mobile GLES3 parts still do not expose — and without it every
+    // FloatType render target in this file silently comes back incomplete and
+    // the frame is black. Detect it once here so the affected buffers can pick a
+    // half-float layout instead of failing.
+    this.canRenderFloat = !!renderer.getContext().getExtension('EXT_color_buffer_float');
+    if (!this.canRenderFloat) {
+      console.warn(
+        '[render] EXT_color_buffer_float missing — metering falls back to half float'
+      );
     }
     renderer.autoClear = false;
     renderer.autoClearColor = false;
@@ -191,10 +247,20 @@ export class RenderSystem {
     });
     this.patcher = new MaterialPatcher(this.csm.uniforms, {
       cascades: this.csm.cascades,
-      quality: this.qLevel,
+      quality: this.shaderTier,
     });
 
-    this.gbuffer = new GBuffer();
+    // The prepass writes 20 bytes per pixel across three attachments, and at the
+    // low preset SIXTEEN OF THEM HAVE NO READER: gtao, ssr, contact, taa,
+    // motionBlur and the sky's volumetric reprojection are all off, and they are
+    // the entire consumer list for the normal and velocity channels. Decide the
+    // attachment set from the effects that are actually being constructed below,
+    // so the pass is depth-only at low and unchanged everywhere else. Depth is
+    // never optional — it is public API (soft particles, fog) and the exposure
+    // meter's sky rejection.
+    const usesNormal = !!(q.gtao || q.ssr || this.qLevel >= 1 /* contact shadows */);
+    const usesVelocity = !!(q.taa || q.motionBlur || q.volumetrics);
+    this.gbuffer = new GBuffer({ normal: usesNormal, velocity: usesVelocity });
     this.gtao = q.gtao ? new Gtao() : null;
     this.contact = this.qLevel >= 1 ? new ContactShadows() : null;
     this.ssr = q.ssr ? new Ssr() : null;
@@ -204,7 +270,7 @@ export class RenderSystem {
     // while the sights are actually up, so it costs nothing in hipfire.
     this.dof = this.qLevel >= 1 ? new DepthOfField() : null;
     this.bloom = q.bloom ? new Bloom(this.qLevel >= 2 ? 6 : 5) : null;
-    this.exposure = new AutoExposure();
+    this.exposure = new AutoExposure(this.canRenderFloat);
     // Headroom for a physically-scaled sky (sunlit scenes reach ~5000 cd/m2).
     // The lower limit is the night exposure lock: a moonlit street meters at
     // EV100 -5.2, and letting the meter chase that turns night into an overcast
@@ -212,9 +278,17 @@ export class RenderSystem {
     // binds after dark.
     this.exposure.setLimits(-4.3, 20);
     this.lut = createGradeLut('default');
-    this.composite = createComposite(this.lut);
-    this.viewComposite = createViewComposite();
-    this.fxaa = q.taa ? null : createFxaa();
+    /**
+     * The two passes that touch every backbuffer pixel and do nothing but
+     * colour: tonemap+grade+lens, and the edge filter over the result. On the
+     * phone tier they compile at mediump — see the note on `Pass`. Everything
+     * that reconstructs a position from depth keeps highp, and is off here
+     * anyway.
+     */
+    const postPrecision = this.qLevel < 0 ? 'mediump' : undefined;
+    this.composite = createComposite(this.lut, q.taa === true, postPrecision);
+    this.viewComposite = createViewComposite(postPrecision);
+    this.fxaa = q.taa ? null : createFxaa(postPrecision);
     // MSAA on the viewmodel target only. It is the one buffer whose geometric
     // edges no longer get a temporal filter, and 4x on a single small pass is
     // far cheaper than any spatial substitute at the same quality.
@@ -473,6 +547,18 @@ export class RenderSystem {
     this._visit = this._visit.bind(this);
     this._visitView = this._visitView.bind(this);
 
+    // ---- runtime quality scaling -----------------------------------------
+    this._reallocate = false;
+    this._cssW = 1;
+    this._cssH = 1;
+    this._built = this._snapshotBuilt();
+    this._initDynRes(ctx);
+    this._inQuality = false;
+    this._onQuality = () => {
+      if (!this._inQuality) this._applyQuality();
+    };
+    ctx.events.on('ui:quality', this._onQuality);
+
     const w = ctx.canvas.clientWidth || 1920;
     const h = ctx.canvas.clientHeight || 1080;
     this.resize(w, h, ctx);
@@ -523,6 +609,26 @@ export class RenderSystem {
   /** The PMREM environment currently in use. */
   requestEnvMap() {
     return this.ctx?.scene.environment ?? this.envMap;
+  }
+
+  /**
+   * Screen-space hurt state, all 0..1, folded into the final composite.
+   *
+   *   desat  world desaturation / contrast / brightness pull
+   *   blood  blood vignette + corner smears
+   *   flash  on-hit red flash (screen-blended)
+   *   beat   heartbeat ring, and the swell it puts on the vignette
+   *
+   * `ui` pushes these once a frame (src/ui/index.js -> src/ui/health.js). They
+   * used to be five stacked DOM layers over the canvas, each one a
+   * `backdrop-filter`, an SVG filter or a `mix-blend-mode` — none of which can
+   * be cached, because their input is a canvas that redraws every frame. All
+   * four at zero is the exact no-op: the shader branch is not taken.
+   *
+   * Zero allocation: writes straight into the uniform's Vector4.
+   */
+  setHurt(desat = 0, blood = 0, flash = 0, beat = 0) {
+    this.composite.uniforms.uHurt.value.set(desat, blood, flash, beat);
   }
 
   /** Let the sky subsystem hand us its PMREM. */
@@ -862,35 +968,385 @@ export class RenderSystem {
   }
 
   // ==========================================================================
+  //  runtime quality (see ARCHITECTURE.md "Runtime quality changes")
+  // ==========================================================================
+
+  /** Everything `init()` baked out of the preset, so `setQuality` can diff it. */
+  _snapshotBuilt() {
+    const q = this.q;
+    return {
+      quality: this.ctx.config.quality,
+      cascades: this.csm.cascades,
+      shadowMapSize: this.csm.mapSize,
+      qLevel: this.qLevel,
+      taa: !!q.taa,
+      gtao: !!q.gtao,
+      ssr: !!q.ssr,
+      motionBlur: !!q.motionBlur,
+      volumetrics: !!q.volumetrics,
+      bloomLevels: this.bloom ? this.bloom.levels : 0,
+      postPrecision: this.qLevel < 0 ? 'mediump' : undefined,
+      hasNormal: this.gbuffer.hasNormal,
+      hasVelocity: this.gbuffer.hasVelocity,
+      viewSamples: this._viewSamples,
+      anisotropy: q.anisotropy,
+      renderScale: q.renderScale,
+      dprCap: q.dprCap,
+    };
+  }
+
+  /**
+   * Apply a quality preset to the LIVE pipeline.
+   *
+   * Called with a name it switches `config` first; called with `null` it assumes
+   * `config.q` has already been updated (that is the `ui:quality` path — the
+   * menu writes the config and announces it, and this subsystem is the
+   * listener). `config.q` is the same object `this.q` points at, so by the time
+   * we get here the numbers have already moved under us and the diff is against
+   * `this._built`, which records what was actually CONSTRUCTED.
+   *
+   * ---------------------------------------------------------------------------
+   * WHAT IS HOT AND WHAT NEEDS A RELOAD — this is the whole design, and it is
+   * decided by one question: does the field change a shader DEFINE, and if so,
+   * in how many programs?
+   * ---------------------------------------------------------------------------
+   * HOT (no lit-material recompile; the only programs that can compile here are
+   * full-screen post passes, bounded at ~14):
+   *   renderScale, dprCap   sizes only -> `resize()` with the early-out defeated
+   *   shadowMapSize         array texture realloc; `owCsmMapSize` is a uniform
+   *   shadowDistance        cascade fit only
+   *   gtao/ssr/taa/motionBlur/bloom/contact/dof  effect OBJECTS; the material
+   *                         side of all three screen-space terms is gated by the
+   *                         `owFeat` UNIFORM, not by a define, so switching them
+   *                         off costs nothing and switching them on costs only
+   *                         that effect's own passes
+   *   bloom levels          JS-side mip pyramid, same two programs
+   *   viewmodel MSAA        target realloc, not a program key
+   *   gbuffer attachments   ONE prepass ShaderMaterial (up to 4 variants)
+   *   composite/fxaa        3 programs, and only when `taa` or the post
+   *                         precision tier actually flips
+   *
+   * RELOAD (each one re-keys every lit material in the scene — ARCHITECTURE.md
+   * measures that class of event at 640-900 ms of stall, and there are ~170 of
+   * them):
+   *   cascades       `OW_CASCADES` is a define in the patcher chunk AND in the
+   *                  sky's volumetric march pass. `this.csm.cascades` is
+   *                  therefore frozen for the session; a preset that asks for a
+   *                  different count keeps the one it booted with.
+   *   quality tier   PCF/PCSS tap counts (`csmShaderChunk`) are defines. Frozen
+   *                  as `this.shaderTier`; `qLevel` still moves so the EFFECT
+   *                  gating follows the preset.
+   *   lightSlots     the visible point-light count, i.e. the permutation key
+   *                  ARCHITECTURE.md is about. Owned by `world`.
+   *   textureScale / simpleMaterials / propDensity / drawDistance / physicsHz /
+   *   particleBudget / decalBudget / anisotropy / skyQuality — baked into
+   *   geometry, textures or the fixed step by their own subsystems at init.
+   *
+   * Everything in the second list is REPORTED, not silently ignored.
+   *
+   * @param {string|null} name  preset to switch to, or null to re-read config
+   * @returns {object} { ok, quality, applied[], reload[], programs, ms }
+   */
+  setQuality(name) {
+    const cfg = this.ctx.config;
+    if (name && name !== cfg.quality) {
+      try {
+        cfg.setQuality(name);
+      } catch (err) {
+        console.warn('[render] setQuality', err);
+        return { ok: false, reason: String(err.message ?? err) };
+      }
+    }
+    const res = this._applyQuality();
+    // `ui:quality` is a BROADCAST (ARCHITECTURE.md): sky, physics and audio each
+    // own a piece of the same change. Calling this method directly — the dev
+    // console, a probe, an auto-scaler — must reconfigure the whole engine, not
+    // just the renderer, or those three silently keep the old preset's budget.
+    // The guard stops our own listener from doing the work a second time; the
+    // menu path never reaches here at all, it emits and we listen.
+    this._inQuality = true;
+    try {
+      this.ctx.events.emit('ui:quality', { quality: cfg.quality });
+    } finally {
+      this._inQuality = false;
+    }
+    return res;
+  }
+
+  /** The render half of a quality change. See `setQuality`. */
+  _applyQuality() {
+    const cfg = this.ctx.config;
+    const t0 = performance.now();
+    const renderer = this.renderer;
+    const q = this.q;
+    const was = this._built;
+    const programsBefore = renderer.info.programs?.length ?? 0;
+    const applied = [];
+    const reload = [];
+
+    this.qLevel = QUALITY_LEVEL[cfg.quality] ?? 3;
+
+    // ---- what this subsystem cannot do without a reload -------------------
+    if (q.cascades !== was.cascades) reload.push(`cascades ${was.cascades}->${q.cascades}`);
+    if (this.qLevel !== this.shaderTier) reload.push('shadow tap tier');
+    if (q.anisotropy !== was.anisotropy) reload.push('anisotropy (textures are baked)');
+    this.maxAnisotropy = Math.min(q.anisotropy, renderer.capabilities.getMaxAnisotropy());
+
+    // ---- cascades: resolution and distance are both hot -------------------
+    if (this.csm.setMapSize(q.shadowMapSize)) applied.push(`shadowMapSize=${this.csm.mapSize}`);
+    if (this.csm.maxDistance !== q.shadowDistance) {
+      this.csm.maxDistance = q.shadowDistance;
+      applied.push(`shadowDistance=${q.shadowDistance}`);
+    }
+
+    // ---- effect objects ---------------------------------------------------
+    const swap = (key, want, make, teardown) => {
+      if (!!this[key] === want) return;
+      if (want) {
+        this[key] = make();
+      } else {
+        this[key].dispose();
+        this[key] = null;
+        teardown?.();
+      }
+      applied.push(`${key}=${want}`);
+    };
+    const u = this.patcher.uniforms;
+    swap('gtao', !!q.gtao, () => new Gtao(), () => {
+      // The sampler must not be left pointing at a disposed texture. The shader
+      // never reaches it (owFeat.x gates the fetch) but the renderer still binds
+      // whatever is in the uniform.
+      u.owAoTex.value = null;
+      this.aoTexture = null;
+    });
+    swap('ssr', !!q.ssr, () => new Ssr(), () => { u.owSsrTex.value = null; });
+    swap('contact', this.qLevel >= 1, () => new ContactShadows(), () => { u.owContactTex.value = null; });
+    swap('taa', !!q.taa, () => new Taa());
+    swap('motionBlur', !!q.motionBlur, () => new MotionBlur());
+    swap('dof', this.qLevel >= 1, () => new DepthOfField());
+
+    const wantBloom = q.bloom ? (this.qLevel >= 2 ? 6 : 5) : 0;
+    if (wantBloom !== (this.bloom ? this.bloom.levels : 0)) {
+      this.bloom?.dispose();
+      this.bloom = wantBloom ? new Bloom(wantBloom) : null;
+      applied.push(`bloom=${wantBloom}`);
+    }
+
+    // ---- the two passes whose PROGRAM depends on the preset ---------------
+    const postPrecision = this.qLevel < 0 ? 'mediump' : undefined;
+    const wantSharpen = q.taa === true;
+    if (postPrecision !== was.postPrecision || wantSharpen !== was.taa) {
+      this.composite.dispose();
+      this.composite = createComposite(this.lut, wantSharpen, postPrecision);
+      this.viewComposite.dispose();
+      this.viewComposite = createViewComposite(postPrecision);
+      applied.push('composite');
+    }
+    if (!!this.fxaa !== !q.taa || (this.fxaa && postPrecision !== was.postPrecision)) {
+      this.fxaa?.dispose();
+      this.fxaa = q.taa ? null : createFxaa(postPrecision);
+      applied.push(`fxaa=${!!this.fxaa}`);
+    }
+
+    // ---- prepass attachments (FASE 1 baked these at construction) ---------
+    const usesNormal = !!(q.gtao || q.ssr || this.qLevel >= 1);
+    const usesVelocity = !!(q.taa || q.motionBlur || q.volumetrics);
+    if (usesNormal !== this.gbuffer.hasNormal || usesVelocity !== this.gbuffer.hasVelocity) {
+      this.gbuffer.dispose();
+      this.gbuffer = new GBuffer({ normal: usesNormal, velocity: usesVelocity });
+      applied.push(`gbuffer=${usesNormal ? 'n' : ''}${usesVelocity ? 'v' : ''}d`);
+    }
+
+    const wantSamples = this.qLevel >= 2 ? 4 : this.qLevel >= 1 ? 2 : 0;
+    if (wantSamples !== this._viewSamples) {
+      this._viewSamples = wantSamples;
+      this.viewRt?.dispose();
+      this.viewRt = null; // rebuilt lazily by _ensureViewRt
+      applied.push(`viewMsaa=${wantSamples}`);
+    }
+
+    // ---- resolution ladder + the realloc ----------------------------------
+    if (cfg.quality !== was.quality) this._initDynRes(this.ctx);
+    else q.renderScale = this.dynres.ladder[this.dynres.index];
+    this._reallocate = true;
+    this.resize(this._cssW, this._cssH, this.ctx);
+    this._applySettings();
+    // The velocity history and the SSR/TAA reprojection sources were just
+    // thrown away; treat the next frame as the first one.
+    this._firstFrame = true;
+
+    this._built = this._snapshotBuilt();
+    const programs = renderer.info.programs?.length ?? 0;
+    const out = {
+      ok: true,
+      quality: cfg.quality,
+      applied,
+      reload,
+      programsBefore,
+      programs,
+      ms: Math.round(performance.now() - t0),
+    };
+    console.info(
+      `[render] quality -> ${cfg.quality} · ${applied.length} applied · ` +
+        `${reload.length} need a reload${reload.length ? ` (${reload.join(', ')})` : ''}`
+    );
+    return out;
+  }
+
+  // ==========================================================================
+  //  dynamic resolution
+  // ==========================================================================
+
+  /**
+   * Set the internal render scale and REALLOCATE.
+   *
+   * `resize()` early-outs when the internal size it computes matches the one it
+   * already has, which is right for a window resize and wrong for this: the
+   * scale is an input to that computation, so without `_reallocate` a runtime
+   * change was silently a no-op (the whole reason this method exists).
+   *
+   * @returns {boolean} true if the chain was reallocated.
+   */
+  setRenderScale(s) {
+    const c = Math.min(2, Math.max(0.25, s));
+    if (Math.abs(c - this.q.renderScale) < 1e-4) return false;
+    this.q.renderScale = c;
+    this._reallocate = true;
+    this.resize(this._cssW, this._cssH, this.ctx);
+    return true;
+  }
+
+  /**
+   * Build the resolution ladder for the current preset.
+   *
+   * The preset's own `renderScale` is the CEILING, never a starting point to
+   * climb past: `mobile` asking for 0.62 means 0.62 is as sharp as that preset
+   * ever gets, so its ladder is 0.5 / 0.6 / 0.62 and `high` gets all five steps.
+   * The scaler starts at the top, which is what makes it invisible on a machine
+   * that is keeping up — and bit-identical to no scaler at all.
+   */
+  _initDynRes(ctx) {
+    const base = this.q.renderScale;
+    const ladder = [];
+    for (let i = 0; i < DYNRES_STEPS.length; i++) {
+      if (DYNRES_STEPS[i] < base - 1e-6) ladder.push(DYNRES_STEPS[i]);
+    }
+    ladder.push(base);
+    const params = new URLSearchParams(location.search);
+    this.dynres = {
+      /**
+       * OFF in capture mode, unconditionally. The pixel gate advances frames by
+       * hand under SwiftShader where every frame reads as the engine's 100 ms
+       * clamp; a scaler that believed that would reallocate the whole HDR chain
+       * mid-shot and no A/B comparison would mean anything again.
+       */
+      enabled: !ctx.config.deterministic && params.get('dynres') !== '0',
+      ladder,
+      index: ladder.length - 1,
+      /** EMA of the UNSCALED frame time, ms. */
+      ema: 1000 / 60,
+      /** ~20-frame time constant. */
+      alpha: 0.05,
+      /** Frames of agreement required before any step. */
+      holdFrames: 30,
+      hold: 0,
+      /** Sustained ms/frame that buys a step down (below ~50 fps)... */
+      downMs: 20,
+      /** ...and the one that buys a step back up (above ~59 fps). The gap is
+       *  the hysteresis: a display vsynced at exactly 60 sits between them. */
+      upMs: 17,
+      changes: 0,
+    };
+    this._dynPrevRaw = ctx.time.raw;
+    this.q.renderScale = base;
+  }
+
+  /**
+   * One EMA sample, and at most one quantised step per `holdFrames`.
+   *
+   * Quantised because every change reallocates ~8 render targets, and hysteretic
+   * because the frame that does the reallocating is itself slow: a naive
+   * controller reads its own realloc as evidence that it should scale down
+   * again. After a step the EMA is re-seeded to the middle of the dead band, so
+   * the next move needs a full window of fresh evidence rather than inheriting
+   * the average that triggered this one.
+   *
+   * Zero allocation: scalars in a preallocated object.
+   */
+  _updateDynRes(ctx) {
+    const d = this.dynres;
+    if (!d.enabled || d.ladder.length < 2) return;
+    const raw = ctx.time.raw;
+    const dt = raw - this._dynPrevRaw;
+    this._dynPrevRaw = raw;
+    // `time.raw` is already clamped to 0.1 s a frame by the engine, so a
+    // tab-switch cannot inject a spike here; 0 happens on the first frame and
+    // whenever the harness pumps without advancing the clock.
+    if (dt <= 0) return;
+    d.ema += (dt * 1000 - d.ema) * d.alpha;
+    if (d.hold < d.holdFrames) {
+      d.hold++;
+      return;
+    }
+    let i = d.index;
+    if (d.ema > d.downMs) i--;
+    else if (d.ema < d.upMs) i++;
+    if (i === d.index || i < 0 || i >= d.ladder.length) return;
+    d.index = i;
+    d.hold = 0;
+    d.ema = (d.downMs + d.upMs) * 0.5;
+    d.changes++;
+    this.setRenderScale(d.ladder[i]);
+  }
+
+  // ==========================================================================
   //  sizing
   // ==========================================================================
 
   resize(w, h, ctx) {
-    const pr = Math.min(globalThis.devicePixelRatio || 1, 1.5);
+    // The DPR cap is a QUALITY decision, not a constant. The composite, FXAA and
+    // the canvas blit all run at the full backbuffer, so a 1.5 cap on a phone
+    // (which reports 2.6-3.0) means those passes cover 2.25x the pixels of the
+    // internal render target — the single largest fixed cost left in a mobile
+    // frame, and one `renderScale` does nothing about because it only sizes the
+    // HDR chain.
+    const pr = Math.min(globalThis.devicePixelRatio || 1, this.q.dprCap ?? 1.5);
     this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
+    // Remembered so `setRenderScale` / `setQuality` can re-enter this method
+    // without the engine handing them the canvas size again.
+    this._cssW = w;
+    this._cssH = h;
 
     const dw = Math.max(1, Math.floor(w * pr));
     const dh = Math.max(1, Math.floor(h * pr));
     const rw = Math.max(1, Math.floor(dw * this.q.renderScale));
     const rh = Math.max(1, Math.floor(dh * this.q.renderScale));
 
+    const displayChanged = this.displaySize.width !== dw || this.displaySize.height !== dh;
     this.displaySize.width = dw;
     this.displaySize.height = dh;
-    if (this.screenSize.width === rw && this.screenSize.height === rh && this.hdrRt) return;
+    // `_reallocate` is the escape hatch for a RUNTIME change: `renderScale`,
+    // `dprCap` and the effect set are all inputs to the sizes computed above, so
+    // a size-equality test is not evidence that the buffers are still right.
+    const forced = this._reallocate;
+    this._reallocate = false;
+    if (!forced && this.screenSize.width === rw && this.screenSize.height === rh && this.hdrRt) {
+      return;
+    }
     this.screenSize.width = rw;
     this.screenSize.height = rh;
 
     this.hdrRt?.dispose();
     this.hdrRt = hdrTarget(rw, rh, { depthBuffer: true, name: 'hdr' });
-    // The viewmodel gets its own colour+depth buffer with 4x MSAA, cleared to
-    // TRANSPARENT black so the composite has real coverage to work with.
+    // The viewmodel target is allocated LAZILY, on the first frame something
+    // other than our own light rig is in `viewScene` (see `_ensureViewRt`).
+    // It is a full-resolution half-float colour buffer plus depth plus up to 4x
+    // MSAA — 40 MB at 1080p — and for the whole of the loading screen, every
+    // menu frame and every capture-harness shot that does not draw a weapon,
+    // nothing ever samples it.
     this.viewRt?.dispose();
-    this.viewRt = hdrTarget(rw, rh, {
-      depthBuffer: true,
-      samples: this._viewSamples,
-      name: 'viewmodel',
-    });
+    this.viewRt = null;
     this.pingRt[0]?.dispose();
     this.pingRt[1]?.dispose();
     this.pingRt[0] = hdrTarget(rw, rh, { name: 'ping0' });
@@ -930,7 +1386,27 @@ export class RenderSystem {
 
     for (const p of this.passes) p.resize?.(rw, rh);
     this.taa?.reset();
-    this.exposure.reset();
+    // The metering chain is 64x64 -> 8x8 -> 1x1 and its adaptation state is a
+    // 1x1 float: NONE of it is a function of the screen size. Resetting it on a
+    // pure `renderScale` step would snap the exposure instead of easing it,
+    // which is the one thing a resolution scaler must not be visible as. A real
+    // window/backbuffer change still resets, exactly as before.
+    if (displayChanged) this.exposure.reset();
+  }
+
+  /**
+   * The viewmodel's own MSAA colour+depth target, built on demand.
+   * Cleared to TRANSPARENT black by the frame loop so the composite has real
+   * coverage to work with.
+   */
+  _ensureViewRt() {
+    if (this.viewRt) return this.viewRt;
+    this.viewRt = hdrTarget(this.screenSize.width, this.screenSize.height, {
+      depthBuffer: true,
+      samples: this._viewSamples,
+      name: 'viewmodel',
+    });
+    return this.viewRt;
   }
 
   // ==========================================================================
@@ -1269,6 +1745,9 @@ export class RenderSystem {
     const { scene, camera, viewScene, viewCamera } = ctx;
     const dt = Math.min(0.1, Math.max(1 / 480, ctx.time.dt || 1 / 60));
     this.frame++;
+    // Before anything reads `screenSize` or binds a target: a step reallocates
+    // the whole chain, and it must not happen between two passes of one frame.
+    this._updateDynRes(ctx);
     renderer.info.reset();
 
     camera.updateMatrixWorld();
@@ -1414,7 +1893,7 @@ export class RenderSystem {
       // the shadow/AO/fill injection. It just no longer feeds the gbuffer.
       this._collectViewScene(viewScene);
 
-      renderer.setRenderTarget(this.viewRt);
+      renderer.setRenderTarget(this._ensureViewRt());
       // Transparent clear: the composite needs coverage, and the MSAA resolve
       // turns partially covered edge pixels into premultiplied fractional alpha.
       renderer.setClearColor(0x000000, 0);
@@ -1593,12 +2072,27 @@ export class RenderSystem {
     this._debugPass.render(renderer, null);
   }
 
-  /** Dev aid: dump the metering chain. `render.debugExposure()` in console. */
+  /**
+   * Dev aid: dump the metering chain. `render.debugExposure()` in console.
+   *
+   * The metering targets are FloatType only while `EXT_color_buffer_float` is
+   * there; without it `AutoExposure` falls back to half float (see its
+   * constructor), and reading a HalfFloatType attachment into a Float32Array is
+   * a GL type mismatch — the readback either throws or comes back as noise, so
+   * the ONE diagnostic that could explain a black frame on the part that needs
+   * explaining was the one that broke. Same decode path as `probeHdr`.
+   */
   debugExposure() {
-    const buf = this._readback;
+    const half = !this.canRenderFloat;
+    if (half && !this._readbackH) {
+      this._readbackH = new Uint16Array(4);
+      this._readbackH2 = new Uint16Array(4);
+    }
+    const dec = half ? THREE.DataUtils.fromHalfFloat : (v) => v;
+    const buf = half ? this._readbackH : this._readback;
     this.renderer.readRenderTargetPixels(this.exposure.rt1, 0, 0, 1, 1, buf);
-    const avgLog = buf[0] / Math.max(buf[1], 1e-4);
-    const out = this._readback2;
+    const avgLog = dec(buf[0]) / Math.max(dec(buf[1]), 1e-4);
+    const out = half ? this._readbackH2 : this._readback2;
     this.renderer.readRenderTargetPixels(
       this.exposure.adapt[this.exposure._flip],
       0,
@@ -1607,7 +2101,7 @@ export class RenderSystem {
       1,
       out
     );
-    return { avgLum: Math.pow(2, avgLog), ev100: out[1], exposure: out[0] };
+    return { avgLum: Math.pow(2, avgLog), ev100: dec(out[1]), exposure: dec(out[0]) };
   }
 
   _logExposure() {
@@ -1664,6 +2158,7 @@ export class RenderSystem {
   }
 
   dispose() {
+    if (this._onQuality) this.ctx?.events.off('ui:quality', this._onQuality);
     this.csm.dispose();
     this.gbuffer.dispose();
     this.gtao?.dispose();

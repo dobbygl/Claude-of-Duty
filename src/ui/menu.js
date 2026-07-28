@@ -1,6 +1,11 @@
 import { el, setText, setStyle, clamp, damp, ease } from './util.js';
 
-const PRESETS = ['low', 'medium', 'high', 'ultra'];
+/**
+ * `mobile` is first because it is BELOW low, not a variant of it (see
+ * QUALITY_PRESETS). It is offered on desktop too: it is the only way to see what
+ * the phone tier actually looks like without a phone.
+ */
+const PRESETS = ['mobile', 'low', 'medium', 'high', 'ultra'];
 
 /**
  * Pause / settings menu.
@@ -36,6 +41,13 @@ export class PauseMenu {
       b.addEventListener('click', () => this.setQuality(p));
       this.qBtns.push(b);
     }
+
+    // A preset switch reaches the render pipeline immediately (resolution,
+    // shadows, post chain) but cannot rebuild baked geometry, baked textures,
+    // the point-light slot budget or the fixed physics step — those are read
+    // once at boot by the subsystems that own them. Say so, rather than letting
+    // a player wonder why `mobile` still runs the desktop street.
+    el('div', 'hint', this.rows, 'RESTART FOR GEOMETRY, TEXTURES & PHYSICS RATE');
 
     // ---- sensitivity -----------------------------------------------------
     this.sens = this._slider('Mouse Sensitivity', 0.2, 3.0, 0.01, (v) => {

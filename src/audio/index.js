@@ -517,6 +517,10 @@ export class AudioSystem {
     const ev = ctx.events;
     const on = (name, fn) => this._offs.push(ev.on(name, fn));
 
+    // The only quality field this subsystem can honour live. Everything else it
+    // reads from the preset is baked into a synthesised buffer at boot.
+    on('ui:quality', () => this.field?.setHrtf(ctx.config.q.hrtf !== false));
+
     on('weapon:fire', (p) => this._onFire(p));
     on('weapon:reload', (p) => this._onReload(p));
     on('weapon:shell', (p) => this._onShell(p));
