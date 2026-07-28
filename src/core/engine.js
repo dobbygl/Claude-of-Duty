@@ -76,6 +76,39 @@ export class Engine {
     this._last = 0;
     this._running = false;
     this._onResize = () => this.resize();
+
+    /**
+     * Optional frame profiler. `null` in every normal session — and in EVERY
+     * capture session, unconditionally, because the only thing that ever sets it
+     * is `src/core/perfhud.js`, which is not constructed under
+     * `config.deterministic`.
+     *
+     * When it is null `step()` runs exactly the code it ran before this field
+     * existed: the hot loops keep their original `for..of` form in the `else`
+     * branch, and the cost of profiling being OFF is four predictable
+     * `!== null` tests per frame.
+     *
+     * Contract (all optional, all called with primitives — nothing here may
+     * allocate):
+     *   frameBegin()                start of step()
+     *   phase(idx, ms)              0 input, 1 fixed, 2 update, 3 lateUpdate, 4 render
+     *   system(phaseIdx, id, ms)    per-subsystem slice of phases 1..3
+     *   gpuBegin() / gpuEnd()       bracket the render subsystem's GL work
+     *   frameEnd(cpuMs, steps)      end of step()
+     */
+    this.profiler = null;
+    /** Scratch timestamps for the profiler. Scalars, never read when off. */
+    this._p0 = 0;
+    this._pFrame0 = 0;
+
+    /**
+     * Boot stage timings, filled by `init()` and appended to by `src/main.js`.
+     * `[label, ms]` pairs in wall-clock order. This is the ONLY record of where
+     * a cold start goes, and on a phone a cold start is 15-40 s of black screen
+     * — a number the frame HUD cannot show and the one that decides whether a
+     * "it feels slow" report is about the frame at all.
+     */
+    this.bootStages = [];
   }
 
   add(SystemClass, opts) {
@@ -89,6 +122,10 @@ export class Engine {
       const t0 = performance.now();
       await sys.init?.(this.ctx);
       const ms = performance.now() - t0;
+      // Recorded for every system, not just the slow ones: this list IS the
+      // boot profile (materials = texture bakes, world = level geometry,
+      // physics = the collision BVH, render = the pipeline + its targets).
+      this.bootStages.push(sys.constructor.id, ms);
       if (ms > 50) console.info(`[engine] ${sys.constructor.id} init ${ms.toFixed(0)}ms`);
     }
     this.input.attach();
@@ -137,16 +174,41 @@ export class Engine {
     t.elapsed += t.dt;
     t.frame++;
 
+    // Profiling is entirely opt-in; `prof` is null in every capture session.
+    // `_p0` is a scalar field rather than a local so the marker helper below
+    // needs no closure and no allocation.
+    const prof = this.profiler;
+    if (prof !== null) {
+      prof.frameBegin();
+      this._pFrame0 = this._p0 = performance.now();
+    }
+
     this.input.beginFrame();
 
     this._accum += t.dt;
     let steps = 0;
     const fixedSystems = this.registry.with('fixedUpdate');
     const h = this.fixedDt;
-    while (this._accum >= h && steps < MAX_SUBSTEPS) {
-      for (const sys of fixedSystems) sys.fixedUpdate(h, this.ctx);
-      this._accum -= h;
-      steps++;
+    if (prof !== null) {
+      const tIn = performance.now();
+      prof.phase(0, tIn - this._p0);
+      this._p0 = tIn;
+      while (this._accum >= h && steps < MAX_SUBSTEPS) {
+        for (let i = 0; i < fixedSystems.length; i++) {
+          const sys = fixedSystems[i];
+          const ta = performance.now();
+          sys.fixedUpdate(h, this.ctx);
+          prof.system(1, sys.constructor.id, performance.now() - ta);
+        }
+        this._accum -= h;
+        steps++;
+      }
+    } else {
+      while (this._accum >= h && steps < MAX_SUBSTEPS) {
+        for (const sys of fixedSystems) sys.fixedUpdate(h, this.ctx);
+        this._accum -= h;
+        steps++;
+      }
     }
     // Shed the backlog rather than spiral — but ONLY when there really is one.
     // The old test fired on `steps === MAX_SUBSTEPS` alone, which is also what a
@@ -157,13 +219,53 @@ export class Engine {
     if (steps === MAX_SUBSTEPS && this._accum >= h) this._accum = 0;
     t.alpha = this._accum / h;
 
-    for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
-    for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+    if (prof !== null) {
+      let tp = performance.now();
+      prof.phase(1, tp - this._p0);
+      this._p0 = tp;
 
-    const renderSystem = this.registry.peek('render');
-    if (typeof renderSystem?.render === 'function') renderSystem.render(this.ctx);
+      const upd = this.registry.with('update');
+      for (let i = 0; i < upd.length; i++) {
+        const sys = upd[i];
+        const ta = performance.now();
+        sys.update(t.dt, this.ctx);
+        prof.system(2, sys.constructor.id, performance.now() - ta);
+      }
+      tp = performance.now();
+      prof.phase(2, tp - this._p0);
+      this._p0 = tp;
 
-    this.input.endFrame();
+      const late = this.registry.with('lateUpdate');
+      for (let i = 0; i < late.length; i++) {
+        const sys = late[i];
+        const ta = performance.now();
+        sys.lateUpdate(t.dt, this.ctx);
+        prof.system(3, sys.constructor.id, performance.now() - ta);
+      }
+      tp = performance.now();
+      prof.phase(3, tp - this._p0);
+      this._p0 = tp;
+
+      const renderSystem = this.registry.peek('render');
+      if (typeof renderSystem?.render === 'function') {
+        prof.gpuBegin();
+        renderSystem.render(this.ctx);
+        prof.gpuEnd();
+      }
+      tp = performance.now();
+      prof.phase(4, tp - this._p0);
+
+      this.input.endFrame();
+      prof.frameEnd(performance.now() - this._pFrame0, steps);
+    } else {
+      for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
+      for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+
+      const renderSystem = this.registry.peek('render');
+      if (typeof renderSystem?.render === 'function') renderSystem.render(this.ctx);
+
+      this.input.endFrame();
+    }
   }
 
   dispose() {

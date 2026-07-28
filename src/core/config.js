@@ -204,6 +204,14 @@ export const DEFAULTS = {
   adsSensScale: 0.65,
   invertY: false,
   exposure: 1.0,
+  /**
+   * Diagnostic overlay (`src/core/perfhud.js`). Lives in the config so the
+   * pause menu and the HUD's own gestures share one source of truth without
+   * either side importing the other: the menu writes it and announces
+   * `ui:setting`, the HUD listens and also writes it back when a gesture or F8
+   * toggles it. Forced off in capture mode, where the HUD is not constructed.
+   */
+  perfHud: false,
   /** Capture mode disables anything nondeterministic so screenshots are stable. */
   deterministic: false,
 };

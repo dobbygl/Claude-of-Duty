@@ -16,13 +16,60 @@ meshes, animation and audio are generated procedurally at load time.
    images/HDRIs/models/audio files — the game must run fully offline.
 4. **No `Math.random()` in gameplay or visuals.** Use `ctx.rng` (see
    `src/core/rng.js`) or a `ctx.rng.fork()` you keep. Capture reproducibility
-   depends on it.
+   depends on it. **Seed every stream from a stable key, never from call
+   order** — see "Determinism" below.
 5. **Allocate nothing per-frame.** Preallocate vectors, matrices and arrays in
    `init()` and reuse. A `new THREE.Vector3()` inside `update()` is a bug.
 6. **Dispose what you create.** Geometries, materials, textures and render
    targets get freed in `dispose()`.
 7. `npm run build` must pass and `node tools/capture.mjs` must produce a frame
    after your change. If you break the boot, nobody else can work.
+
+## Determinism
+
+Capture reproducibility is what makes this project reviewable: every optimisation
+so far was accepted or rejected by a pixel gate that assumes the same seed builds
+the same world. Rule 4 keeps randomness inside `ctx.rng`. This section is the part
+that is easy to get wrong anyway.
+
+**A stream must be derived from a stable KEY, not from call order.**
+
+`rng.fork()` with no argument derives from `this.u32()` — the parent's *current
+position*. So the child depends on how many values the parent happened to have
+consumed by then, which means it depends on the order every earlier caller ran in.
+That is invisible until the day someone parallelises, reorders, defers or lazily
+skips one of those callers, and then the whole world changes.
+
+When you generate N independent things, give each one its own stream keyed by its
+own identity:
+
+```js
+// GOOD — building 7 is building 7 no matter who ran first, or in what thread
+for (let i = 0; i < count; i++) buildBuilding(rng.fork(i), i);
+
+// BAD — each building inherits wherever the shared stream happened to be
+for (let i = 0; i < count; i++) buildBuilding(rng, i);
+```
+
+A keyed fork must **not** advance or read the parent's position: derive it from the
+parent's original seed mixed with the key, so `fork(i)` returns the same stream
+whenever and wherever it is called.
+
+This is a hard rule for **content generation** — world geometry, prop placement,
+set dressing, texture bakes, actor variants — because those are the things that get
+parallelised, cached or generated on demand. It is *not* required for sequential
+per-event randomness (recoil per shot, spread per bullet, particle jitter), where a
+single shared stream is correct and cheaper.
+
+Two consequences worth internalising:
+
+- **Order dependence is a silent parallelisation ban.** If your generator only works
+  when its callers run in one exact order, no one can ever move it to a worker
+  without changing every pixel.
+- **Changing a seeding scheme changes the world.** It is a deliberate, one-time,
+  pixel-moving act: regenerate the reference images and say so. Never fold it into a
+  change that is supposed to be pixel-neutral, or the gate can no longer tell a bug
+  from a re-seed.
 
 ## Subsystem interface
 
@@ -90,6 +137,8 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |
 | `explosion` | `{ position, radius, damage }` | any |
 | `resize` | `{ width, height }` | engine |
+| `ui:setting` | `{ key, value }` | ui |
+| ↳ | one row per pause-menu control that is not a preset. `invertY`, and the FASE 6 additions: `renderScale` (the ceiling, announced after `render.setRenderScale`), `dynres`, `dprCap`, `perfHud`. Like `ui:quality` it is a **broadcast**: the menu has already applied what it owns before emitting. `src/core/perfhud.js` listens for `perfHud` — the only listener today — and the shared state lives in `config.perfHud`, so neither side imports the other. | |
 | `ui:quality` | `{ quality }` | ui |
 | ↳ | announced *after* `config.setQuality()` has already rewritten `config.q`. A listener re-reads `ctx.config.q` and applies what it can honour live; it must not assume the change is safe to apply, only that the numbers moved. See "Runtime quality changes". | |
 
@@ -206,6 +255,18 @@ Quantised and hysteretic because every step reallocates the whole HDR chain.
 
 **It is off under `config.deterministic`**, unconditionally. A scaler that
 reallocated mid-shot would make every A/B pixel gate in this repo meaningless.
+
+The pause menu's **Resolution** slider replaces the ladder's TOP rung
+(`dynres.ladder[last]`, then `setRenderScale`) rather than writing an absolute
+scale — so it is a ceiling exactly like the preset's, and the scaler keeps every
+rung below it. `src/ui/menu.js` therefore carries its own copy of the rung list;
+it must stay in step with `DYNRES_STEPS`. The **Dynamic Resolution** switch is
+`dynres.enabled`, and turning it off returns the picture to that ceiling.
+
+`dprCap` is also live, through `engine.resize()`: `render.resize()` calls
+`setPixelRatio`/`setSize` and updates `displaySize` *before* its size early-out,
+and every buffer downstream is sized from the internal target, so a cap change
+that happens to leave the internal size alone leaves nothing stale.
 
 ### Pre-warm
 

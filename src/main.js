@@ -15,6 +15,15 @@ import { AudioSystem } from './audio/index.js';
 
 import { installShotApi } from './dev/shots.js';
 import { prewarm } from './core/prewarm.js';
+import { installPerfHud } from './core/perfhud.js';
+
+/**
+ * Wall-clock at the moment this module starts executing. `performance.now()` is
+ * measured from navigationStart, so this IS the cost of everything before the
+ * game gets control: document parse, module graph fetch, module evaluation.
+ * It is the first row of the boot profile in the perf HUD.
+ */
+const T_MODULE = performance.now();
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
@@ -76,6 +85,7 @@ engine
   .add(UiSystem)
   .add(AudioSystem);
 
+const T_INIT = performance.now();
 try {
   await engine.init();
 } catch (err) {
@@ -106,9 +116,19 @@ const shotApi = installShotApi(engine, { capture, lockstep });
 // lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
 // cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
 // in src/ui/style.js.
+const T_WARM = performance.now();
 const warmup = params.get('prewarm') === '0' ? { ok: false, reason: 'disabled by ?prewarm=0' } : await prewarm(engine);
 console.info('[boot] prewarm', warmup);
 window.__PREWARM__ = warmup;
+
+// Boot profile. `engine.init()` already recorded one row per subsystem; these
+// three bracket it, so the rows sum to the whole cold start. On a phone that
+// start is 15-40 s of black screen, and if THAT is what "it feels slow" means
+// then no amount of LOD work in FASE 7 changes anything — which is exactly the
+// question this row set exists to answer.
+engine.bootStages.unshift('page', T_MODULE, 'construct', T_INIT - T_MODULE);
+engine.bootStages.push('prewarm', performance.now() - T_WARM);
+const T_FRAMES = performance.now();
 
 engine.start();
 
@@ -119,16 +139,27 @@ engine.start();
 // then raise __READY__; the shot is therefore always applied at engine frame 3, no
 // matter how long boot (or pre-warm) took in wall-clock terms.
 const BOOT_FRAMES = 3;
-if (lockstep) {
-  await shotApi.pump(BOOT_FRAMES);
+/**
+ * The diagnostic overlay. `installPerfHud` returns null under
+ * `config.deterministic`, so a capture session grows no DOM node, no listener
+ * and no `engine.profiler` — the FASE 3/4/5 pixel gates cannot see it.
+ * Activation: `?perf=1`, a three-finger tap, a long press in the top-right
+ * corner, or F8. See src/core/perfhud.js.
+ */
+const finishBoot = () => {
+  engine.bootStages.push('firstframes', performance.now() - T_FRAMES);
   clearBoot();
   window.__READY__ = true;
+  window.__PERF__ = installPerfHud(engine, { params });
+};
+if (lockstep) {
+  await shotApi.pump(BOOT_FRAMES);
+  finishBoot();
 } else {
   let warm = 0;
   const readyProbe = () => {
     if (++warm >= BOOT_FRAMES) {
-      clearBoot();
-      window.__READY__ = true;
+      finishBoot();
       return;
     }
     requestAnimationFrame(readyProbe);

@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+    <title>PerfHud self-test</title>
+    <!--
+      Test harness for src/core/perfhud.js, in the same spirit as
+      src/core/touch.selftest.html and src/physics/selftest.js.
+
+      The HUD's activation gestures, its ring statistics and its report format
+      have nothing to do with the game: they are DOM and arithmetic. Booting the
+      whole engine to poke them costs ~60 s of procedural world generation, so
+      this page mounts PerfHud against a STUB engine — a fake registry, a fake
+      render subsystem with a real-looking `renderer.info`, and a canned boot
+      profile — and a driver can then synthesise pointer streams and assert on
+      the result in seconds.
+
+      Open it on the dev server (`/src/core/perfhud.selftest.html`) and drive it
+      through `window.__H__` (the HUD) and `window.__E__` (the stub engine), or
+      point a playwright script at it. It is not part of the build — vite only
+      treats index.html as an entry.
+    -->
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; touch-action: none; background: #11161b; }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import { PerfHud } from '/src/core/perfhud.js';
+
+      const ids = ['render', 'materials', 'sky', 'world', 'physics', 'player',
+                   'weapons', 'fx', 'ai', 'ui', 'audio'];
+
+      /** A canvas, so `renderer.getContext()` hands back a real WebGL2 context
+       *  and the GPU-timer probe exercises its real code path. */
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 64;
+      document.body.appendChild(canvas);
+      const gl = canvas.getContext('webgl2');
+
+      const fakeRender = {
+        renderer: {
+          info: {
+            render: { calls: 1009, triangles: 5850000 },
+            programs: new Array(169),
+            memory: { textures: 118, geometries: 222 },
+          },
+          getContext: () => gl,
+          getPixelRatio: () => 1,
+        },
+        screenSize: { width: 496, height: 248 },
+        displaySize: { width: 800, height: 400 },
+        dynres: { enabled: true, ladder: [0.5, 0.6, 0.62], index: 2, changes: 0, ema: 16.4 },
+        qLevel: -1,
+        shaderTier: -1,
+        csm: { cascades: 2 },
+      };
+
+      const engine = {
+        config: { quality: 'mobile', deterministic: false, perfHud: false, q: { renderScale: 0.62, shadowMapSize: 512 } },
+        profiler: null,
+        bootStages: ['page', 620, 'construct', 4, 'render', 190, 'materials', 4100,
+                     'sky', 430, 'world', 4530, 'physics', 3, 'player', 5,
+                     'weapons', 2280, 'fx', 930, 'ai', 5980, 'ui', 107, 'audio', 0,
+                     'prewarm', 8100, 'firstframes', 900],
+        registry: { ordered: ids.map((id) => ({ constructor: { id } })) },
+      };
+      /** Enough of an EventBus for the `ui:setting` path the pause menu uses. */
+      const listeners = new Map();
+      const events = {
+        on: (t, f) => { (listeners.get(t) ?? listeners.set(t, []).get(t)).push(f); },
+        off: (t, f) => {
+          const l = listeners.get(t);
+          if (l) l.splice(l.indexOf(f) >>> 0, 1);
+        },
+        emit: (t, p) => { for (const f of listeners.get(t) ?? []) f(p); },
+      };
+
+      engine.ctx = {
+        config: engine.config,
+        events,
+        peek: (id) => (id === 'render' ? fakeRender : null),
+      };
+
+      const hud = new PerfHud(engine).attach();
+
+      /**
+       * Feed the profiler one synthetic frame, exactly as `Engine.step` does.
+       * The frame-time ring is driven by `performance.now()` deltas, so a
+       * driver that wants a specific frame time back-dates the previous mark
+       * rather than writing into the ring — that way the real ring code, the
+       * real outlier filter and the real percentile all run.
+       */
+      window.__FRAME__ = (frameMs = 16, sys = { render: 4, ai: 2, physics: 1 }) => {
+        const p = engine.profiler;
+        if (!p) return;
+        hud._lastEnd = performance.now() - frameMs;
+        p.frameBegin();
+        p.phase(0, 0.1);
+        p.phase(1, sys.physics ?? 0);
+        p.phase(2, (sys.ai ?? 0) + 1);
+        p.phase(3, 0.3);
+        p.phase(4, sys.render ?? 0);
+        for (const k in sys) p.system(2, k, sys[k]);
+        p.frameEnd(frameMs * 0.6);
+      };
+
+      window.__H__ = hud;
+      window.__E__ = engine;
+      window.__EV__ = events;
+      window.__READY__ = true;
+    </script>
+  </body>
+</html>
