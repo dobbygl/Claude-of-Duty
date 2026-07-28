@@ -69,6 +69,15 @@ void main() {
 }
 `;
 
+// 8x8 box reduce. The taps land exactly on source texel centres — output texel
+// j covers source texels 8j..8j+7, whose centres are at ( x - 3.5 ) * uTexel
+// from the output centre — so two of these collapse 64x64 to 1x1 as an EXACT
+// mean, the same number the old 4x4 chain produced in three passes.
+//
+// One pass fewer is one render-target bind fewer, and a bind is the expensive
+// part here: the buffers involved are 64x64 and smaller, so the whole chain is
+// bandwidth-trivial and bind-bound. Nothing about a 1x1 float scalar justified
+// six render targets and five passes.
 const REDUCE = /* glsl */ `
 precision highp float;
 uniform sampler2D tSrc;
@@ -76,13 +85,13 @@ uniform vec2 uTexel;
 varying vec2 vUv;
 void main() {
   vec2 s = vec2( 0.0 );
-  for ( int y = 0; y < 4; y ++ ) {
-    for ( int x = 0; x < 4; x ++ ) {
-      vec2 o = ( vec2( float( x ), float( y ) ) - 1.5 ) * uTexel;
+  for ( int y = 0; y < 8; y ++ ) {
+    for ( int x = 0; x < 8; x ++ ) {
+      vec2 o = ( vec2( float( x ), float( y ) ) - 3.5 ) * uTexel;
       s += texture2D( tSrc, vUv + o ).rg;
     }
   }
-  gl_FragColor = vec4( s / 16.0, 0.0, 1.0 );
+  gl_FragColor = vec4( s / 64.0, 0.0, 1.0 );
 }
 `;
 
@@ -122,7 +131,14 @@ void main() {
 `;
 
 export class AutoExposure {
-  constructor() {
+  /**
+   * @param {boolean} [canRenderFloat=true] whether EXT_color_buffer_float is
+   *   present. Without it a FloatType colour target is framebuffer-incomplete
+   *   and the whole metering chain silently produces zeros — half float still
+   *   resolves the log-luminance average to well under a hundredth of a stop,
+   *   so it is the right fallback rather than a reason to give up.
+   */
+  constructor(canRenderFloat = true) {
     this.logPass = new Pass('ow-loglum', LOGLUM, {
       tSrc: { value: null },
       tDepth: { value: null },
@@ -141,10 +157,13 @@ export class AutoExposure {
       uLimits: { value: new THREE.Vector4(-4, 16, 1, 1.0) },
     });
 
-    const o = { type: THREE.FloatType, format: THREE.RGBAFormat, name: 'exposure' };
+    const o = {
+      type: canRenderFloat ? THREE.FloatType : THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      name: 'exposure',
+    };
     this.rt64 = hdrTarget(64, 64, o);
-    this.rt16 = hdrTarget(16, 16, o);
-    this.rt4 = hdrTarget(4, 4, o);
+    this.rt8 = hdrTarget(8, 8, o);
     this.rt1 = hdrTarget(1, 1, o);
     this.adapt = [hdrTarget(1, 1, o), hdrTarget(1, 1, o)];
     this._flip = 0;
@@ -177,12 +196,9 @@ export class AutoExposure {
     const ru = this.reducePass.uniforms;
     ru.tSrc.value = this.rt64.texture;
     ru.uTexel.value.set(1 / 64, 1 / 64);
-    this.reducePass.render(renderer, this.rt16);
-    ru.tSrc.value = this.rt16.texture;
-    ru.uTexel.value.set(1 / 16, 1 / 16);
-    this.reducePass.render(renderer, this.rt4);
-    ru.tSrc.value = this.rt4.texture;
-    ru.uTexel.value.set(1 / 4, 1 / 4);
+    this.reducePass.render(renderer, this.rt8);
+    ru.tSrc.value = this.rt8.texture;
+    ru.uTexel.value.set(1 / 8, 1 / 8);
     this.reducePass.render(renderer, this.rt1);
 
     const au = this.adaptPass.uniforms;
@@ -206,8 +222,7 @@ export class AutoExposure {
 
   dispose() {
     this.rt64.dispose();
-    this.rt16.dispose();
-    this.rt4.dispose();
+    this.rt8.dispose();
     this.rt1.dispose();
     this.adapt[0].dispose();
     this.adapt[1].dispose();

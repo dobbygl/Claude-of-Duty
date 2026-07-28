@@ -23,7 +23,22 @@ _mesh.frustumCulled = false;
 _mesh.matrixAutoUpdate = false;
 _scene.add(_mesh);
 
-/** Draw `material` over `target` (null = canvas). */
+/**
+ * Draw `material` over `target` (null = canvas).
+ *
+ * `clear` is not cosmetic. A full-screen pass overwrites every pixel it is given,
+ * but a tile-based GPU cannot know that: binding a target without clearing it
+ * makes the driver LOAD the previous contents of every tile out of memory before
+ * the first fragment runs, and store them back afterwards. At 1080p HalfFloat
+ * RGBA that is 16 MB of pointless traffic per bind, and the post chain binds a
+ * dozen targets a frame. `glClear` on the whole attachment is instead a "fast
+ * clear" flag on every tile — no load at all. On an immediate-mode desktop GPU
+ * the clear is close to free, so this is a strict win.
+ *
+ * It is only correct for a pass that (a) covers the whole target and (b) does not
+ * blend against what is already there; `Pass.render` derives it from the
+ * material's own blending mode, which is exactly that test.
+ */
 export function blit(renderer, material, target, clear = false, layer = 0) {
   _mesh.material = material;
   renderer.setRenderTarget(target, layer);
@@ -37,6 +52,17 @@ export function disposeFullScreen() {
 
 /** A post-processing pass: a ShaderMaterial plus the uniforms it owns. */
 export class Pass {
+  /**
+   * `opts.precision` (only 'mediump' is meaningful) rewrites the pass's own
+   * `precision highp float;` header. On a phone that is a real saving — half the
+   * register file per invocation and, on most mobile architectures, double-rate
+   * ALU — and it is safe for exactly the passes whose arithmetic is COLOUR:
+   * values in a bounded range that are about to be quantised to 8 bits anyway.
+   * It is NOT safe for anything that reconstructs a world-space position from
+   * depth (gtao, ssr, contact, the volumetric composite), where mediump's 10-bit
+   * mantissa on a 900 m view ray is metres of error, so those passes never ask
+   * for it. Every one of them is off at the phone tier regardless.
+   */
   constructor(name, fragmentShader, uniforms, opts = {}) {
     this.name = name;
     this.uniforms = uniforms;
@@ -44,7 +70,10 @@ export class Pass {
       name,
       uniforms,
       vertexShader: FS_VERT,
-      fragmentShader,
+      fragmentShader:
+        opts.precision === 'mediump'
+          ? fragmentShader.replace('precision highp float;', 'precision mediump float;')
+          : fragmentShader,
       depthTest: false,
       depthWrite: false,
       blending: opts.blending ?? THREE.NoBlending,
@@ -53,8 +82,19 @@ export class Pass {
       transparent: opts.blending !== undefined && opts.blending !== THREE.NoBlending,
     });
   }
-  render(renderer, target, clear = false) {
-    blit(renderer, this.material, target, clear);
+  /**
+   * `clear` defaults to "yes, unless this pass blends against the destination"
+   * — see the note on `blit`. Bloom's up-chain is the one pass that does blend,
+   * and its `blending` is assigned after construction, so the test is made here
+   * rather than cached.
+   */
+  render(renderer, target, clear) {
+    blit(
+      renderer,
+      this.material,
+      target,
+      clear === undefined ? this.material.blending === THREE.NoBlending : clear
+    );
   }
   dispose() {
     this.material.dispose();

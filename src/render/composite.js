@@ -27,12 +27,26 @@ uniform vec2 uResolution;
 uniform vec4 uLens;      // x chromatic, y vignette, z grainAmount, w time
 uniform vec4 uGrade;     // x bloomStrength, y lutStrength, z sharpen, w lutSize
 uniform vec4 uLook;      // x agx slope, y agx power, z agx sat, w exposureBias
+uniform vec4 uHurt;      // x desaturation, y blood vignette, z hit flash, w heartbeat
 varying vec2 vUv;
 
 vec3 sampleLut( vec3 c ) {
   float n = uGrade.w;
   vec3 uvw = clamp( c, 0.0, 1.0 ) * ( ( n - 1.0 ) / n ) + ( 0.5 / n );
   return texture( tLut, uvw ).rgb;
+}
+
+// Smoothed value noise. Only used by the hurt block below, where it stands in
+// for the feTurbulence the DOM overlay used to displace the vignette edge with.
+float owVnoise( vec2 p ) {
+  vec2 i = floor( p );
+  vec2 f = fract( p );
+  f = f * f * ( 3.0 - 2.0 * f );
+  float a = owHash12( i );
+  float b = owHash12( i + vec2( 1.0, 0.0 ) );
+  float c = owHash12( i + vec2( 0.0, 1.0 ) );
+  float d = owHash12( i + vec2( 1.0, 1.0 ) );
+  return mix( mix( a, b, f.x ), mix( c, d, f.x ), f.y );
 }
 
 void main() {
@@ -89,6 +103,11 @@ void main() {
   // itself* and the sharpen amplified it, which is where the coarse
   // magenta/green fringing on every high-contrast edge came from. A scalar gain
   // around the centre luminance cannot invent chroma at all.
+  // OW_SHARPEN is only defined when TAA exists. Without it uGrade.z is pinned
+  // to 0 for the life of the process (see RenderSystem._applySettings), so this
+  // is dead code the compiler cannot prove dead — it still costs registers, and
+  // on a tiler register pressure costs occupancy.
+  #ifdef OW_SHARPEN
   if ( uGrade.z > 0.001 ) {
     float l1 = owLum( n1 ), l2 = owLum( n2 ), l3 = owLum( n3 ), l4 = owLum( n4 );
     float lc = owLum( centre );
@@ -103,6 +122,7 @@ void main() {
     float gain = ( lc + ( lc - lblur ) * amount ) / max( lc, 1e-4 );
     hdr *= clamp( gain, 0.0, 4.0 );
   }
+  #endif
 
   hdr *= exposure;
 
@@ -143,6 +163,76 @@ void main() {
   // --- procedural film grade (display-referred) ----------------------------
   vec3 graded = sampleLut( disp );
   disp = mix( disp, graded, uGrade.y );
+
+  // --- hurt state (display-referred) ---------------------------------------
+  // These four effects were five stacked full-screen DOM layers over the canvas:
+  // a backdrop-filter for the desaturation, two gradients pushed through an
+  // feTurbulence/feDisplacementMap SVG filter for the blood vignette, and two
+  // mix-blend-mode layers for the heartbeat ring and the hit flash. Every one
+  // of them reads the pixels *underneath*, and underneath is a canvas that
+  // redraws every frame, so not one of them could ever be cached in a composited
+  // layer: the browser read back the whole framebuffer, ran a filter graph over
+  // it and recomposited, on every frame, for as long as the player was hurt.
+  // Here it is a handful of ALU ops on a value this pass already holds in a
+  // register. src/ui/health.js publishes the amounts and src/ui/index.js hands
+  // them over through RenderSystem.setHurt.
+  //
+  // The branch is uniform-coherent — every invocation in the draw takes the same
+  // side — so a healthy player pays for a compare. And with uHurt at zero, disp
+  // leaves this block bit-identical, which is what keeps the shot gate clean.
+  if ( uHurt.x + uHurt.y + uHurt.z + uHurt.w > 0.001 ) {
+    // desaturate / contrast / brightness. Exactly the old .ow-desat filter
+    // chain, saturate(.6) contrast(1.04) brightness(.97), mixed by its opacity.
+    if ( uHurt.x > 0.002 ) {
+      float l = owLum( disp );
+      vec3 f = ( ( l + ( disp - l ) * 0.6 ) - 0.5 ) * 1.04 + 0.5;
+      disp = mix( disp, clamp( f * 0.97, 0.0, 1.0 ), uHurt.x );
+    }
+
+    // Organic edge, two octaves. A clean radial ramp is the single most "WebGL
+    // demo" thing a hurt overlay can do, which is the whole reason the DOM
+    // version was paying for a turbulence filter.
+    float warp = ( owVnoise( vUv * vec2( 6.5, 4.2 ) ) - 0.5 ) * 0.085
+               + ( owVnoise( vUv * vec2( 17.0, 11.0 ) ) - 0.5 ) * 0.030;
+
+    // Box coordinates of the old .ow-blood wrapper, which was inset -7%, and the
+    // heartbeat's slow swell of it.
+    vec2 hp = ( vUv - 0.5 ) / ( 1.14 * ( 1.0 + uHurt.w * 0.04 ) );
+
+    if ( uHurt.y > 0.002 ) {
+      // .ow-blood-a: ellipse 78% x 74% about the centre, alpha ramping from 62%
+      // of the radius out to the corners.
+      float t = length( vec2( hp.x / 0.78, hp.y / 0.74 ) ) + warp;
+      float e = clamp( ( t - 0.60 ) / 0.30, 0.0, 1.0 );
+      vec3 blood = mix( vec3( 0.478, 0.055, 0.039 ), vec3( 0.290, 0.031, 0.020 ), e );
+      disp = mix( disp, blood, e * e * 0.62 * uHurt.y );
+
+      // .ow-blood-b: four off-centre smears, multiplied in. Circular in SCREEN
+      // space, so the distance is aspect-corrected rather than uv-corrected.
+      vec2 ar = vec2( uResolution.x / max( uResolution.y, 1.0 ), 1.0 );
+      float sm = smoothstep( 0.30, 0.0, length( ( vUv - vec2( 0.02, 0.22 ) ) * ar ) )
+               + smoothstep( 0.27, 0.0, length( ( vUv - vec2( 0.99, 0.58 ) ) * ar ) )
+               + smoothstep( 0.33, 0.0, length( ( vUv - vec2( 0.26, 1.01 ) ) * ar ) )
+               + smoothstep( 0.31, 0.0, length( ( vUv - vec2( 0.74, -0.02 ) ) * ar ) );
+      sm = clamp( sm + warp * 1.6, 0.0, 1.0 ) * 0.38 * uHurt.y;
+      disp *= mix( vec3( 1.0 ), vec3( 0.376, 0.039, 0.031 ), sm );
+    }
+
+    // .ow-lowbeat: the wider, softer ring that pulses with the heartbeat.
+    if ( uHurt.w > 0.002 ) {
+      float t = length( vec2( hp.x / 0.76, hp.y / 0.70 ) ) + warp;
+      disp = mix( disp, vec3( 0.588, 0.055, 0.039 ),
+                  clamp( ( t - 0.62 ) / 0.34, 0.0, 1.0 ) * 0.34 * uHurt.w );
+    }
+
+    // .ow-hitflash: a 190 ms screen-blended red bloom on every round that lands.
+    if ( uHurt.z > 0.002 ) {
+      float t = length( vec2( ( vUv.x - 0.5 ) / 0.90, ( vUv.y - 0.5 ) / 0.86 ) );
+      vec3 fl = vec3( 0.627, 0.070, 0.047 )
+              * ( mix( 0.22, 0.62, clamp( ( t - 0.40 ) / 0.60, 0.0, 1.0 ) ) * uHurt.z );
+      disp = 1.0 - ( 1.0 - disp ) * ( 1.0 - fl );
+    }
+  }
 
   // --- grain, in code-value space, LESS of it in the darks -----------------
   // Real sensor noise is loudest in the mid/upper mids once it has been
@@ -287,12 +377,17 @@ void main() {
 }
 `;
 
-export function createViewComposite() {
-  return new Pass('ow-view-composite', VIEW_COMPOSITE, {
-    tColor: { value: null },
-    tView: { value: null },
-    uTexel: { value: new THREE.Vector2() },
-  });
+export function createViewComposite(precision) {
+  return new Pass(
+    'ow-view-composite',
+    VIEW_COMPOSITE,
+    {
+      tColor: { value: null },
+      tView: { value: null },
+      uTexel: { value: new THREE.Vector2() },
+    },
+    { precision }
+  );
 }
 
 const DEBUG = /* glsl */ `
@@ -321,7 +416,11 @@ export function createDebug() {
   });
 }
 
-export function createComposite(lut) {
+/**
+ * @param {boolean} sharpen compile the CAS block in (only useful with TAA).
+ * @param {string} [precision] 'mediump' on the phone tier — see Pass.
+ */
+export function createComposite(lut, sharpen = true, precision) {
   return new Pass('ow-composite', COMPOSITE, {
     tColor: { value: null },
     tBloom: { value: null },
@@ -342,12 +441,20 @@ export function createComposite(lut) {
     // Together with a contrast pivot below mid-grey it is what put 18% scene
     // grey on code value 153.
     uLook: { value: new THREE.Vector4(1.0, 1.0, 1.08, 1) },
-  });
+    // Screen-space hurt state, written by RenderSystem.setHurt. Zero is the
+    // exact no-op — the shader branch is not taken and the frame is unchanged.
+    uHurt: { value: new THREE.Vector4(0, 0, 0, 0) },
+  }, { defines: sharpen ? { OW_SHARPEN: 1 } : {}, precision });
 }
 
-export function createFxaa() {
-  return new Pass('ow-fxaa', FXAA, {
-    tColor: { value: null },
-    uTexel: { value: new THREE.Vector2() },
-  });
+export function createFxaa(precision) {
+  return new Pass(
+    'ow-fxaa',
+    FXAA,
+    {
+      tColor: { value: null },
+      uTexel: { value: new THREE.Vector2() },
+    },
+    { precision }
+  );
 }

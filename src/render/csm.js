@@ -42,18 +42,8 @@ export class CascadedShadowMaps {
     this.backDistance = 140;
     this.enabled = true;
 
-    this.rt = new THREE.WebGLArrayRenderTarget(this.mapSize, this.mapSize, this.cascades, {
-      type: THREE.FloatType,
-      format: THREE.RedFormat,
-      minFilter: THREE.NearestFilter,
-      magFilter: THREE.NearestFilter,
-      wrapS: THREE.ClampToEdgeWrapping,
-      wrapT: THREE.ClampToEdgeWrapping,
-      depthBuffer: true,
-      stencilBuffer: false,
-      generateMipmaps: false,
-    });
-    this.rt.texture.name = 'csm';
+    this.rt = null;
+    this._allocMaps();
 
     this.cameras = [];
     this.matrices = [];
@@ -80,6 +70,20 @@ export class CascadedShadowMaps {
 
     this.depthMaterial = new THREE.ShaderMaterial({
       name: 'csm-depth',
+      // DOUBLE SIDED, AND IT HAS TO STAY THAT WAY.
+      //
+      // The obvious optimisation here is FrontSide: for a closed solid the back
+      // face is always further from the light than the front face, so it loses
+      // the depth test anyway and rasterising it is pure waste — about half the
+      // shadow pass's fragment work at 11 M triangles a frame.
+      //
+      // MEASURED, and it is not free. Front-face culling the cascades moved
+      // 1.7-3.4% of pixels by up to 140/255 across the shot set, in solid
+      // patches on facades and props rather than as edge noise: this world is
+      // built from open shells and single-quad panels whose winding does not
+      // point at the sun, and every one of them stopped casting. Whole shadows
+      // vanished. If this is ever revisited it needs a per-material caster
+      // side — two override materials and two draw lists — not a global switch.
       side: THREE.DoubleSide,
       vertexShader: /* glsl */ `
         #include <common>
@@ -122,6 +126,53 @@ export class CascadedShadowMaps {
     this.casterCounts = new Int32Array(this.cascades);
     /** Diagnostics: cascades skipped entirely on the last frame. */
     this.emptyCascades = 0;
+  }
+
+  /**
+   * (Re)allocate the cascade array at the current `mapSize` / `cascades`, and
+   * point the shared uniform at the new texture if the uniforms already exist.
+   */
+  _allocMaps() {
+    this.rt?.dispose();
+    this.rt = new THREE.WebGLArrayRenderTarget(this.mapSize, this.mapSize, this.cascades, {
+      type: THREE.FloatType,
+      format: THREE.RedFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      wrapS: THREE.ClampToEdgeWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      depthBuffer: true,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+    this.rt.texture.name = 'csm';
+    if (this.uniforms) {
+      this.uniforms.owCsmMaps.value = this.rt.texture;
+      this.uniforms.owCsmMapSize.value.set(this.mapSize, 1 / this.mapSize);
+    }
+  }
+
+  /**
+   * Change the cascade resolution on a LIVE renderer. Reallocates the array
+   * texture IN PLACE — the `uniforms` object and every uniform object inside it
+   * keep their identity, which is not optional: `MaterialPatcher` spreads this
+   * object into every lit material's uniform set and `sky/volumetrics.js`
+   * spreads it into its march pass, both **by reference**. Handing out a new
+   * CascadedShadowMaps instead of mutating this one leaves every one of those
+   * consumers pointing at the disposed texture of the old one.
+   *
+   * Costs NO shader recompile: `owCsmMapSize` is a uniform, not a define. The
+   * cascade COUNT is a define (`OW_CASCADES`, in two subsystems) and is
+   * deliberately not changeable here — see `RenderSystem.setQuality`.
+   *
+   * @returns {boolean} true if anything was reallocated.
+   */
+  setMapSize(size) {
+    const s = Math.min(Math.max(64, size | 0), 2048);
+    if (s === this.mapSize) return false;
+    this.mapSize = s;
+    this._allocMaps();
+    return true;
   }
 
   /** Recompute cascade fits. `sunDir` points FROM the scene TOWARD the sun. */
@@ -354,7 +405,11 @@ export class CascadedShadowMaps {
     scene.overrideMaterial = prevOverride;
     renderer.autoClear = prevAutoClear;
     renderer.setClearColor(this._prevClear, prevAlpha);
-    renderer.setRenderTarget(null);
+    // Deliberately NOT setRenderTarget(null) here. Every caller binds its own
+    // target immediately afterwards (the prepass, or the forward pass), so the
+    // unbind was a redundant framebuffer switch — and on a tile GPU an unbind is
+    // where the driver decides to resolve and flush, which is exactly what we do
+    // not want between two passes that never touch the backbuffer.
   }
 
   /**
@@ -458,7 +513,10 @@ export class CascadedShadowMaps {
  */
 export function csmShaderChunk(cascades, quality) {
   const blockerTaps = quality >= 3 ? 16 : quality >= 2 ? 12 : 8;
-  const pcfTaps = quality >= 3 ? 20 : quality >= 2 ? 14 : 8;
+  // 4 taps on the phone tier (quality < 0). The shadow map there is 512px over
+  // 40 m, so the penumbra an 8-tap Poisson disc is spreading is already under a
+  // texel — the extra seven fetches buy dithering, not softness.
+  const pcfTaps = quality >= 3 ? 20 : quality >= 2 ? 14 : quality < 0 ? 4 : 8;
   const pcss = quality >= 2;
 
   // Sampler-array-free: one 2D array texture, so the layer index can be

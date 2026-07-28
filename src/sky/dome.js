@@ -12,12 +12,32 @@ import { fullScreenGeometry, SKY_VERT } from './fullscreen.js';
 /**
  * The visible sky.
  *
- * Drawn as a full-screen triangle at renderOrder -10000 with depth test and
- * depth write off, exactly the way `scene.background` works internally — so it
- * fills the frame before any geometry and costs one primitive. The ray
- * direction is rebuilt from `camera.projectionMatrixInverse` inside
- * `onBeforeRender`, which means it picks up the renderer's TAA jitter and the
- * sun disc gets properly resolved sub-pixel antialiasing instead of stair steps.
+ * Drawn as a full-screen triangle, LAST in the opaque queue, depth-TESTED
+ * against the world and writing no depth. The ray direction is rebuilt from
+ * `camera.projectionMatrixInverse` inside `onBeforeRender`, which means it picks
+ * up the renderer's TAA jitter and the sun disc gets properly resolved sub-pixel
+ * antialiasing instead of stair steps.
+ *
+ * WHY IT IS LAST AND NOT FIRST. This used to run at renderOrder -10000 with
+ * `depthTest: false`, the way `scene.background` works internally: it painted
+ * every pixel of the frame and the world then drew over 60-80% of it. That made
+ * the single most expensive fragment shader in the engine — three LUT fetches,
+ * two cloud decks, the star field, the aureoles, the discs — run on pixels that
+ * were guaranteed to be thrown away. The vertex shader already emits
+ * `gl_Position = vec4( ndc, 1.0, 1.0 )`, i.e. NDC z exactly 1.0 at the far
+ * plane, so with the default LessEqual depth function the sky passes only where
+ * the depth buffer is still at its cleared value — exactly the pixels no opaque
+ * geometry covered. Same pixels, same values, none of the overdraw.
+ *
+ * Two properties of the frame make this exact rather than approximate:
+ *   - the world pass clears colour AND depth before it draws (render/index.js),
+ *     so "depth == 1.0" means "nothing was drawn here";
+ *   - the material is opaque, so three sorts it into the OPAQUE queue and
+ *     renderOrder +10000 puts it after all opaque geometry but still before
+ *     every transparent object (decals, particles, glass, haze), which is the
+ *     order they were composited in before.
+ * Anything in the world that wanted to be behind the sky would have to be opaque
+ * AND not write depth; nothing in this engine is.
  *
  * `userData.owNoPrepass` keeps it out of the depth/normal/velocity prepass and
  * out of the shadow cascades, per the render contract.
@@ -189,7 +209,16 @@ vec3 skMoonDisc( vec3 rayDir, float theta, int oct ) {
 
 /**
  * @param rayDir  normalised world direction
- * @param quality 1 = screen, 0 = environment map (fewer octaves, no star points)
+ * @param quality 2 = screen, 1 = screen on the phone tier, 0 = environment map.
+ *
+ * The distinction between 2 and 1 is which fbm octave counts the frame pays
+ * for: the cumulus deck alone is 6 density + 4 lighting octaves of 3D value
+ * noise per pixel, and it is the most expensive block in the whole shader. At 1
+ * those drop to 3 and 2, exactly the counts the environment bake has always
+ * used, and the starfield loses two octaves. What quality 1 does NOT drop —
+ * because it is what makes a sky read as a sky rather than as a gradient — is
+ * the sun disc and the star POINTS. Only the env bake (0) goes without those,
+ * and it can: the sun is a directional light in the IBL, not a texel.
  */
 vec3 skSample( vec3 rayDir, int quality ) {
   vec3 ambSky = skAmbientSky();
@@ -222,7 +251,7 @@ vec3 skSample( vec3 rayDir, int quality ) {
   vec3 moonLow  = uMoonIrradiance * skTransmittance( pLow,  uMoonDir );
   vec3 moonHigh = uMoonIrradiance * skTransmittance( pHigh, uMoonDir );
   vec4 cl = skClouds( rayDir, uSunDir, sunLow, sunHigh,
-                      uMoonDir, moonLow, moonHigh, ambSky, quality );
+                      uMoonDir, moonLow, moonHigh, ambSky, quality > 1 ? 1 : 0 );
 
   // ---- night sky, BEHIND the decks ---------------------------------------
   // Stars have to be occluded by cloud. A star seen *through* an opaque cumulus
@@ -232,7 +261,7 @@ vec3 skSample( vec3 rayDir, int quality ) {
   // deck's own radiance at night is so low that 40% of a star is still a star.
   // The multiplier is above one because a deck that is optically thick enough to
   // hide its own texture is thick enough to hide a point source completely.
-  vec3 night = skNightSky( rayDir, quality > 0 ? 5 : 3, quality > 0 );
+  vec3 night = skNightSky( rayDir, quality > 1 ? 5 : 3, quality > 0 );
   col += night * ( 1.0 - clamp( cl.a * 1.9, 0.0, 1.0 ) );
 
   if ( cl.a > 1.0e-4 ) {
@@ -267,7 +296,7 @@ vec3 skSample( vec3 rayDir, int quality ) {
   // The discs go in AFTER the roll-off: they are supposed to clip and bloom,
   // and they are the only thing in the sky that is.
   if ( quality > 0 ) col += skSunDisc( rayDir, thetaS );
-  col += skMoonDisc( rayDir, thetaM, quality > 0 ? 4 : 2 );
+  col += skMoonDisc( rayDir, thetaM, quality > 1 ? 4 : 2 );
 
   return max( col, vec3( 0.0 ) );
 }
@@ -289,13 +318,14 @@ void main() {
 }
 `;
 
+/** `SK_SCREEN_Q` is injected as a define: 2 everywhere, 1 on the phone tier. */
 const DOME_FRAG = /* glsl */ `
 precision highp float;
 ${SKY_BODY}
 in vec3 vRay;
 layout(location = 0) out vec4 fragColor;
 void main() {
-  fragColor = vec4( skSample( normalize( vRay ), 1 ), 1.0 );
+  fragColor = vec4( skSample( normalize( vRay ), SK_SCREEN_Q ), 1.0 );
 }
 `;
 
@@ -317,8 +347,10 @@ void main() {
 export class SkyDome {
   /**
    * @param {object} uniforms shared uniform objects, owned by SkySystem
+   * @param {object} [opts]
+   * @param {number} [opts.quality] 1 = full screen dome (default), 0 = phone.
    */
-  constructor(uniforms) {
+  constructor(uniforms, opts = {}) {
     this.uniforms = {
       ...uniforms,
       uInvProj: { value: new THREE.Matrix4() },
@@ -328,11 +360,15 @@ export class SkyDome {
     this.material = new THREE.ShaderMaterial({
       name: 'sky-dome',
       uniforms: this.uniforms,
+      defines: { SK_SCREEN_Q: (opts.quality ?? 1) > 0 ? '2' : '1' },
       vertexShader: DOME_VERT,
       fragmentShader: DOME_FRAG,
       glslVersion: THREE.GLSL3,
       side: THREE.DoubleSide,
-      depthTest: false,
+      // Depth-tested at the far plane, drawn after the world: early-Z rejects
+      // every pixel the geometry already covered. See the header note.
+      depthTest: true,
+      depthFunc: THREE.LessEqualDepth,
       depthWrite: false,
       blending: THREE.NoBlending,
       fog: false,
@@ -342,7 +378,8 @@ export class SkyDome {
     this.mesh = new THREE.Mesh(fullScreenGeometry(), this.material);
     this.mesh.name = 'sky-dome';
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = -10000;
+    // Last in the opaque queue, still ahead of everything transparent.
+    this.mesh.renderOrder = 10000;
     this.mesh.matrixAutoUpdate = false;
     // Render contract: stay out of the prepass, the cascades and contact shadows.
     this.mesh.userData.owNoPrepass = true;

@@ -235,8 +235,13 @@ void main() {
 `;
 
 export class SkyLuts {
-  constructor(renderer, shared) {
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.quality] 1 = full (default), 0 = phone tier.
+   */
+  constructor(renderer, shared, opts = {}) {
     this.renderer = renderer;
+    const low = (opts.quality ?? 1) <= 0;
 
     this.transmittanceRt = floatTarget(256, 64, { name: 'sky-transmittance' });
     this.multiScatterRt = hdrTarget(32, 32, { name: 'sky-multiscatter' });
@@ -244,7 +249,14 @@ export class SkyLuts {
     // of azimuth, which is the difference between a readable warm band around a
     // low sun and a visibly interpolated smear. The remaining loss of the Mie
     // forward peak is restored analytically by skAureole in dome.js.
-    this.skyViewRt = hdrTarget(384, 192, { name: 'sky-view' });
+    //
+    // The phone tier takes Hillaire's size: this LUT is re-baked whenever the
+    // sun moves more than 0.35 degrees, and at 192x96 that rebake is a quarter
+    // of the pixels. The aureole, which is the part of the sky where the
+    // interpolation is actually visible, is analytic and unaffected.
+    this.skyViewRt = low
+      ? hdrTarget(192, 96, { name: 'sky-view' })
+      : hdrTarget(384, 192, { name: 'sky-view' });
     this.ambientRt = hdrTarget(2, 1, { name: 'sky-ambient' });
     this.skyViewRt.texture.wrapS = THREE.RepeatWrapping;
 

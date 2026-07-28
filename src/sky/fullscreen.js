@@ -41,10 +41,19 @@ void main() {
 }
 `;
 
-/** Draw `material` over the whole of `target` (null = canvas). */
-export function blit(renderer, material, target) {
+/**
+ * Draw `material` over the whole of `target` (null = canvas).
+ *
+ * The clear is a bandwidth optimisation, not a correctness one: every pass here
+ * covers the target completely and none of them blend, but a tile-based GPU has
+ * no way to know that and will LOAD the target's previous contents into every
+ * tile before the first fragment runs. Clearing turns that load into a per-tile
+ * fast-clear flag. Half-float RGBA at 1080p is 16 MB of traffic per bind.
+ */
+export function blit(renderer, material, target, clear = true) {
   _mesh.material = material;
   renderer.setRenderTarget(target);
+  if (clear) renderer.clear(true, false, false);
   renderer.render(_scene, _camera);
 }
 
