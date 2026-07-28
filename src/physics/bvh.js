@@ -635,6 +635,16 @@ export class StaticWorld {
   }
 
   /**
+   * Per-triangle AABBs, 6 floats each, indexed by triangle. Exposed so a caller
+   * that queried once for a whole articulated body (see Ragdoll) can re-filter
+   * that one candidate list per limb with the same box test the leaves use,
+   * instead of paying for a traversal per limb.
+   */
+  get triAabb() {
+    return this._taabb;
+  }
+
+  /**
    * Swept capsule against the static world. The capsule translates linearly;
    * per candidate triangle we run conservative advancement on the exact
    * segment/triangle distance function, which is convex under linear motion —

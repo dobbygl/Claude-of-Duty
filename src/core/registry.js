@@ -82,17 +82,61 @@ export class Registry {
   }
 }
 
-/** Minimal typed event bus. Handlers are called synchronously. */
+/**
+ * Minimal typed event bus. Handlers are called synchronously.
+ *
+ * ZERO-ALLOCATION DISPATCH. `emit` used to iterate `[...set]` — a fresh array
+ * (plus a Set iterator) on every dispatch, and `bullet:impact` alone runs
+ * hundreds of times a second in a firefight, so the copies were a steady GC
+ * drip during exactly the frames that could least afford one. Handlers now live
+ * in a dense array walked by index.
+ *
+ * The copy existed so a handler could unsubscribe during dispatch. That is
+ * preserved by *deferring* the removal: `off()` inside a dispatch flags the slot
+ * and the list is compacted when the outermost dispatch returns, so
+ *   - the in-flight dispatch still sees exactly the handler set it started with,
+ *     which is what the array copy did;
+ *   - the list is never mutated while it is being walked;
+ *   - the next `emit` sees the removal.
+ * `emit` also snapshots the length, so a handler subscribing during dispatch is
+ * not called by that same dispatch — again matching the old copy.
+ */
 export class EventBus {
   #map = new Map();
 
+  /** @returns {{fns: Function[], dead: boolean[], depth: number, pending: number}} */
+  #list(type) {
+    let l = this.#map.get(type);
+    if (!l) {
+      l = { fns: [], dead: [], depth: 0, pending: 0 };
+      this.#map.set(type, l);
+    }
+    return l;
+  }
+
   on(type, fn) {
-    (this.#map.get(type) ?? this.#map.set(type, new Set()).get(type)).add(fn);
+    const l = this.#list(type);
+    // Set semantics: subscribing the same function twice is a no-op.
+    const i = l.fns.indexOf(fn);
+    if (i < 0) {
+      l.fns.push(fn);
+      l.dead.push(false);
+    } else if (l.dead[i]) {
+      // re-subscribed before the deferred removal landed: cancel the removal
+      l.dead[i] = false;
+      l.pending--;
+    }
     return () => this.off(type, fn);
   }
 
   once(type, fn) {
+    // The fired guard, not the unsubscribe, is what makes this fire exactly
+    // once: a re-entrant emit of the same type would otherwise re-enter the
+    // handler before the deferred removal has been applied.
+    let fired = false;
     const off = this.on(type, (e) => {
+      if (fired) return;
+      fired = true;
       off();
       fn(e);
     });
@@ -100,19 +144,51 @@ export class EventBus {
   }
 
   off(type, fn) {
-    this.#map.get(type)?.delete(fn);
+    const l = this.#map.get(type);
+    if (!l) return;
+    const i = l.fns.indexOf(fn);
+    if (i < 0) return;
+    if (l.depth > 0) {
+      // Mid-dispatch: leave the slot in place (the running dispatch keeps the
+      // handler set it started with, exactly as the array copy did) and compact
+      // when it unwinds.
+      if (!l.dead[i]) {
+        l.dead[i] = true;
+        l.pending++;
+      }
+      return;
+    }
+    l.fns.splice(i, 1);
+    l.dead.splice(i, 1);
   }
 
   emit(type, payload) {
-    const set = this.#map.get(type);
-    if (!set) return;
-    // Copy so handlers may unsubscribe during dispatch.
-    for (const fn of [...set]) {
+    const l = this.#map.get(type);
+    if (l === undefined) return;
+    const fns = l.fns;
+    const n = fns.length;
+    if (n === 0) return;
+    l.depth++;
+    for (let i = 0; i < n; i++) {
+      const fn = fns[i];
       try {
         fn(payload);
       } catch (err) {
         console.error(`[events] handler for "${type}" threw:`, err);
       }
+    }
+    if (--l.depth === 0 && l.pending > 0) {
+      const dead = l.dead;
+      let w = 0;
+      for (let i = 0; i < fns.length; i++) {
+        if (dead[i]) continue;
+        fns[w] = fns[i];
+        dead[w] = false;
+        w++;
+      }
+      fns.length = w;
+      dead.length = w;
+      l.pending = 0;
     }
   }
 

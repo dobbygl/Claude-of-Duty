@@ -20,6 +20,7 @@ import { MASK, SURFACE_PROPS } from './surfaces.js';
 
 const _m3 = new THREE.Matrix3();
 const _m3b = new THREE.Matrix3();
+const _ONE = new THREE.Vector3(1, 1, 1);
 
 let _nextId = 1;
 
@@ -84,6 +85,23 @@ export class RigidBody {
     /** Bounding radius used for broadphase and CCD substep sizing. */
     this.boundRadius = Math.hypot(hx, hy, hz);
     this.minExtent = Math.min(hx, hy, hz);
+    /**
+     * Radius of the sphere that encloses the proxy a RAY is actually tested
+     * against — which for a capsule is the OBB (radius, halfHeight+radius,
+     * radius), not the half extents. Used as a cheap reject before composing the
+     * body's world matrix. Must never under-estimate or rays start missing.
+     */
+    this.rayRadius =
+      this.shape === 'sphere'
+        ? this.radius
+        : this.shape === 'capsule'
+          ? Math.hypot(this.radius, this.halfHeight + this.radius, this.radius)
+          : this.boundRadius;
+
+    /* Lazily built inverse world matrix for ray tests — see rayInverse(). */
+    this._rayInv = null;
+    this._rayPx = NaN; this._rayPy = 0; this._rayPz = 0;
+    this._rayQx = 0; this._rayQy = 0; this._rayQz = 0; this._rayQw = 0;
 
     if (opts.position) this.position.copy(opts.position);
     if (opts.quaternion) this.quaternion.copy(opts.quaternion);
@@ -148,6 +166,32 @@ export class RigidBody {
   wake() {
     this.sleeping = false;
     this.sleepTimer = 0;
+  }
+
+  /**
+   * World -> body matrix for OBB ray tests, cached until the body actually
+   * moves. Rebuilding it per ray per body was a compose + a 4x4 inverse for
+   * every one of up to 96 pieces of debris on every bullet, tracer probe and
+   * ground query; a settled pile now costs seven float compares instead.
+   *
+   * The cache is keyed on the transform values rather than invalidated by the
+   * solver, so no future writer of `position`/`quaternion` can leave it stale.
+   */
+  rayInverse() {
+    const p = this.position, q = this.quaternion;
+    let m = this._rayInv;
+    if (
+      m !== null &&
+      this._rayPx === p.x && this._rayPy === p.y && this._rayPz === p.z &&
+      this._rayQx === q.x && this._rayQy === q.y && this._rayQz === q.z && this._rayQw === q.w
+    ) {
+      return m;
+    }
+    if (m === null) m = this._rayInv = new THREE.Matrix4();
+    m.compose(p, q, _ONE).invert();
+    this._rayPx = p.x; this._rayPy = p.y; this._rayPz = p.z;
+    this._rayQx = q.x; this._rayQy = q.y; this._rayQz = q.z; this._rayQw = q.w;
+    return m;
   }
 
   applyImpulse(ix, iy, iz, px, py, pz) {
@@ -218,6 +262,20 @@ export class RigidBodyWorld {
     this.bodies = [];
     this.maxBodies = 256;
     this.solverIterations = 4;
+    /**
+     * Ceiling on the discrete substeps one body takes per fixed step. Quality
+     * driven (`q.bodySubsteps`) — the CCD sweep above the discrete loop is what
+     * stops a fast body tunnelling, so this only trades solve accuracy for time.
+     */
+    this.maxSubsteps = 12;
+    /**
+     * Bodies lighter than this solve with `lightSolverIterations` instead of the
+     * full count: a 12 g shell casing has no authority over anything it touches,
+     * so the extra Gauss-Seidel passes only refine a bounce nobody can see.
+     * 0 disables the tier, which is what every preset but `mobile` uses.
+     */
+    this.lightMassThreshold = 0;
+    this.lightSolverIterations = 2;
 
     // contact scratch
     this._cn = new Float32Array(MAX_CONTACTS * 3);
@@ -365,7 +423,7 @@ export class RigidBodyWorld {
     const maxStepDist = Math.max(0.004, probeR * 0.75);
     let sub = b.ccd ? Math.ceil(travel / maxStepDist) : 1;
     if (!(sub >= 1)) sub = 1;
-    if (sub > 12) sub = 12;
+    if (sub > this.maxSubsteps) sub = this.maxSubsteps;
     const h = dt / sub;
 
     for (let s = 0; s < sub; s++) {
@@ -504,7 +562,11 @@ export class RigidBodyWorld {
       if (-vn > maxApproach) { maxApproach = -vn; impactIdx = k; }
     }
 
-    for (let iter = 0; iter < this.solverIterations; iter++) {
+    const iterations =
+      this.lightMassThreshold > 0 && b.mass < this.lightMassThreshold
+        ? this.lightSolverIterations
+        : this.solverIterations;
+    for (let iter = 0; iter < iterations; iter++) {
       for (let k = 0; k < n; k++) {
         const nx = this._cn[k * 3], ny = this._cn[k * 3 + 1], nz = this._cn[k * 3 + 2];
         const rx = this._cp[k * 3] - b.position.x;

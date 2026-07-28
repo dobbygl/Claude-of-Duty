@@ -87,6 +87,9 @@ const DOLL = [
 
 const DEG = Math.PI / 180;
 
+/** Seconds between line-of-sight rays per agent — see `_sense`. */
+const LOS_PERIOD = 0.05;
+
 let _nextId = 1;
 
 export class Agent {
@@ -167,7 +170,10 @@ export class Agent {
           radius: r * this.scale,
           damageScale: dmg,
         });
-        c.userData = { a, b };
+        // Resolve the bone names to rig indices ONCE: syncHitboxes runs 14 name
+        // lookups per actor per frame otherwise, for a pair of bones that can
+        // never change.
+        c.userData = { a, b, ia: RIG.index(a), ib: RIG.index(b) };
         this.colliders.push(c);
       }
     }
@@ -241,6 +247,16 @@ export class Agent {
     this.lodIrrelevant = false;
     this._animSkip = 0;
     this._animAccum = 0;
+    /**
+     * Line-of-sight decimation. The BVH ray to the player is the single most
+     * expensive thing perception does and it was run once per agent per FRAME;
+     * at 20 Hz it is 3x cheaper and still five times faster than the shortest
+     * reaction delay in `_sense` (0.12 s). Staggered off the agent id so a squad
+     * never tests on the same frame, and reset whenever the target leaves the
+     * view cone so re-acquisition is never answered from a stale ray.
+     */
+    this._losTimer = (this.id % 4) * (LOS_PERIOD / 4);
+    this._losResult = false;
 
     /* ---------------- scratch ---------------- */
     this._v = new THREE.Vector3();
@@ -297,16 +313,29 @@ export class Agent {
     const to = this._dir.copy(player).sub(eye);
     const dist = to.length();
     let visible = false;
+    let inCone = false;
     if (dist < this.viewRange) {
       to.multiplyScalar(1 / dist);
       const fwd = this._v2.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
       const dot = fwd.x * to.x + fwd.z * to.z;
       // peripheral vision widens once alerted
       const cone = this.hasTarget ? -0.2 : this.viewCos - this.alertness * 0.25;
-      if (dot > cone || dist < 4.5) {
-        visible = this.phys ? this.phys.lineOfSight(eye, player, this.phys.MASK.SIGHT) : true;
+      inCone = dot > cone || dist < 4.5;
+      if (inCone) {
+        if (!this.phys) visible = true;
+        else {
+          this._losTimer -= dt;
+          if (this._losTimer <= 0) {
+            this._losTimer = LOS_PERIOD;
+            this._losResult = this.phys.lineOfSight(eye, player, this.phys.MASK.SIGHT);
+          }
+          visible = this._losResult;
+        }
       }
     }
+    // Out of the cone: the cached ray says nothing about the next time we look
+    // that way, so the first frame back in the cone pays for a fresh one.
+    if (!inCone) this._losTimer = 0;
     this.targetVisible = visible;
 
     if (visible) {
@@ -887,6 +916,16 @@ export class Agent {
    * chain from the skeleton itself, so the doll starts exactly in the pose the
    * animator left — the death has no pop. `radiusRatio` fattens the capsules
    * (its default is thin enough that a settled body reads as a pancake).
+   *
+   * FASE 3 tried swapping this for the 22-bone DOLL table above (anatomical
+   * radii instead of length-derived ones, limbs welded to the spine with
+   * free-cone stubs). MEASURED, in a six-corpse settle test on the street: two
+   * of the six fell through the world and one bone chain came out stretched
+   * 206% against a 0.17% baseline. The fat torso capsules (0.135 m vs the
+   * auto-spec's 0.046 m) start half-buried even after the 15 cm lift below, and
+   * a capsule whose axis crosses to the far side of a surface has its contact
+   * normal flipped and sinks. DOLL stays dead until someone re-derives the lift
+   * and the stub cones together with it.
    */
   _makeRagdoll(impulse, point) {
     const phys = this.phys;
@@ -989,9 +1028,9 @@ export class Agent {
     const an = this.animator;
     for (let i = 0; i < this.colliders.length; i++) {
       const c = this.colliders[i];
-      const { a, b } = c.userData;
-      an.bonePos(a, this._boneA);
-      an.bonePos(b, this._boneB);
+      const u = c.userData;
+      an.bonePosAt(u.ia, this._boneA);
+      an.bonePosAt(u.ib, this._boneB);
       c.setSegment(
         this._boneA.x, this._boneA.y, this._boneA.z,
         this._boneB.x, this._boneB.y, this._boneB.z

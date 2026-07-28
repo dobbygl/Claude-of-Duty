@@ -101,6 +101,11 @@ export class AiSystem {
     };
     this._shellEvent = { position: new THREE.Vector3(), velocity: new THREE.Vector3() };
     this._tracerEvent = { from: this._tracerFrom, to: this._tracerTo, speed: 800 };
+    /** Reused `damage:dealt` payload — see _testPlayerHit. */
+    this._damageEvent = {
+      target: null, amount: 0, headshot: false, killed: false,
+      point: null, from: null, source: null,
+    };
     this._grenades = [];
     this._grenadeGeo = null;
     this._grenadeMat = null;
@@ -309,11 +314,14 @@ export class AiSystem {
 
     on('bullet:impact', (e) => {
       if (!e || !e.point) return;
+      // The hottest broadcast in the game — every entry AND exit face of every
+      // round reaches it. Squared distance: the only branch that needs the real
+      // one is the close-range suppression, which is also the rare one.
       for (const a of this.agents) {
         if (!a.alive) continue;
-        const d = a.position.distanceTo(e.point);
-        if (d < 3.2) a.suppress(0.5 * (1 - d / 3.2));
-        else if (d < 12) a.hear(e.point, 12);
+        const d2 = a.position.distanceToSquared(e.point);
+        if (d2 < 3.2 * 3.2) a.suppress(0.5 * (1 - Math.sqrt(d2) / 3.2));
+        else if (d2 < 12 * 12) a.hear(e.point, 12);
       }
     });
 
@@ -643,15 +651,18 @@ export class AiSystem {
     // Damage is applied *only* through the event below. `player` listens for
     // `damage:dealt` with itself as the target, so calling applyDamage() here as
     // well wounded the player twice for every round that connected.
-    this.ctx.events.emit('damage:dealt', {
-      target: player ?? 'player',
-      amount,
-      headshot: false,
-      killed: false,
-      point: p,
-      from: this._v2,
-      source: agent,
-    });
+    // Preallocated payload: this fires for every AI round that connects, which
+    // in a firefight is several a second. `point` and `from` are already shared
+    // scratch vectors, so the object literal was the only thing left to drop.
+    const ev = this._damageEvent;
+    ev.target = player ?? 'player';
+    ev.amount = amount;
+    ev.headshot = false;
+    ev.killed = false;
+    ev.point = p;
+    ev.from = this._v2;
+    ev.source = agent;
+    this.ctx.events.emit('damage:dealt', ev);
   }
 
   emitReload(agent) {

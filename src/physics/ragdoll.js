@@ -21,7 +21,7 @@
 
 import * as THREE from 'three';
 import { MASK, SURFACE_PROPS } from './surfaces.js';
-import { closestPtSegSeg, makeClosest } from './math.js';
+import { closestPtSegSeg, makeClosest, segTriangleClosest } from './math.js';
 
 const DEG = Math.PI / 180;
 
@@ -73,6 +73,30 @@ export function humanoidSpec(height = 1.8, scaleMass = 82) {
 const MAX_PARTICLE_STEP = 0.35; // metres per fixed step, anti-explosion clamp
 const SLEEP_MOTION = 0.0022;
 const SLEEP_TIME = 0.6;
+
+/**
+ * How far a bone may travel inside one step and still be covered by the
+ * candidate triangle list gathered at the top of it. Solver corrections are
+ * capped at 0.2 m per contact per iteration and in practice run under a
+ * millimetre once the body is settled, so this is generous by an order of
+ * magnitude; it only costs a slightly wider AABB on the ONE broadphase query
+ * the whole doll now makes.
+ */
+const CAND_MARGIN = 0.3;
+/**
+ * Slack on the per-bone box used to bucket that one candidate list into per-bone
+ * lists. It has to cover how far a bone can move between the bucketing (right
+ * after integration) and the last iteration of the solve. Integration itself is
+ * already clamped to MAX_PARTICLE_STEP and is reflected in the positions the
+ * boxes are built from, so this only has to cover constraint corrections.
+ */
+const BONE_MARGIN = 0.2;
+/**
+ * Contacts kept per bone. The old path shared one 256-deep buffer across the
+ * whole query, and a bone lying on a street tile finds a handful; 64 is well
+ * clear of anything real while bounding the per-doll cache at ~35 KB.
+ */
+const MAX_BONE_CONTACTS = 64;
 
 let _nextRagdollId = 1;
 
@@ -187,7 +211,33 @@ export class Ragdoll {
     this._updateAabb();
 
     this._ss = makeClosest();
+    this._cl = makeClosest();
     this.selfPairs = this._buildSelfPairs();
+
+    /* ---- world-contact cache (see _gatherCandidates / _buildContacts) ---- */
+    let rmax = 0;
+    for (let i = 0; i < nb; i++) if (this.boneRadius[i] > rmax) rmax = this.boneRadius[i];
+    this._maxRadius = rmax;
+    /** Triangles near each bone this step, bucketed ONCE out of one BVH query. */
+    this._bCand = new Int32Array(512);
+    this._bStart = new Int32Array(nb + 1);
+    /** Per-bone slice into the cached contact planes. */
+    this._cStart = new Int32Array(nb + 1);
+    const cap = nb * MAX_BONE_CONTACTS;
+    this._cnx = new Float32Array(cap);
+    this._cny = new Float32Array(cap);
+    this._cnz = new Float32Array(cap);
+    /**
+     * Plane constant: n · (point on the triangle). Float64 on purpose — this is
+     * a world-space dot product, so at the far end of a 120 m level a float32
+     * would quantise it to ~8 um, which is the same order as the 1e-5 m depth
+     * threshold the solver tests against. The normals and the segment parameter
+     * next to it are bounded to 0..1 and stay in float32.
+     */
+    this._cpd = new Float64Array(cap);
+    /** Parameter along the bone axis where the contact sits, 0..1. */
+    this._cs = new Float32Array(cap);
+    this._cfric = new Float32Array(cap);
   }
 
   /**
@@ -294,10 +344,30 @@ export class Ragdoll {
     }
 
     // --- Gauss-Seidel constraint solve ---
-    for (let it = 0; it < this.iterations; it++) {
+    //
+    // CONTACT COST. This loop used to run a full BVH overlapCapsule per bone per
+    // iteration: 25 bones x 8 iterations = 200 broadphase traversals per doll per
+    // step, which was by a wide margin the most expensive thing on the CPU with
+    // bodies on the ground. The broadphase now runs ONCE for the whole doll and
+    // is bucketed per bone (`_gatherCandidates`); `_buildContacts` still runs
+    // every iteration and still narrows to the bone's exact box, so the triangle
+    // set the distance function sees — and therefore the solve — is the same one
+    // the per-bone queries produced. Only the traversal went away.
+    //
+    // MEASURED, and do not "optimise" it back: caching the contact planes and
+    // re-projecting them on the middle iterations (the obvious next step, ~4x
+    // fewer distance tests) is NOT safe. Regenerating every iteration is what
+    // stops a bone that the length/cone constraints pushed into the floor at
+    // iteration k from being left there — a bone that ends a step below a
+    // surface has its contact normal flipped and sinks for good. With the
+    // re-projection in, 1 doll in 6 fell through the street in the settle test.
+    const iters = Math.max(1, this.iterations | 0);
+    this._gatherCandidates();
+    for (let it = 0; it < iters; it++) {
       this._solveDistance();
       this._solveCones();
-      this._solveContacts(it === this.iterations - 1);
+      this._buildContacts();
+      this._solveContacts(it === iters - 1);
     }
     // One self-collision pass per step: enough to stop an arm sinking through
     // the chest, cheap enough to run on every corpse on screen.
@@ -419,28 +489,172 @@ export class Ragdoll {
     }
   }
 
+  /**
+   * ONE broadphase query for the whole doll, bucketed into per-bone candidate
+   * lists with the same box test the BVH leaves use. Everything downstream — two
+   * contact builds and up to eight re-projections — reads these lists, and the
+   * shared BVH scratch is never touched again this step (the next query anywhere
+   * would overwrite it).
+   */
+  _gatherCandidates() {
+    const start = this._bStart;
+    const w = this.world;
+    const nb = this.boneCount;
+    if (!w || w.triCount === 0) {
+      start.fill(0);
+      return;
+    }
+    this._updateAabb();
+    const ab = this.aabb;
+    const m = this._maxRadius + CAND_MARGIN;
+    const n = w.queryAabb(
+      ab.minx - m, ab.miny - m, ab.minz - m,
+      ab.maxx + m, ab.maxy + m, ab.maxz + m,
+      this.mask
+    );
+    if (n === 0) {
+      start.fill(0);
+      return;
+    }
+    const cand = w.candidates;
+    const ta = w.triAabb;
+    let out = this._bCand;
+    let k = 0;
+    for (let i = 0; i < nb; i++) {
+      start[i] = k;
+      const a = this.boneHead[i], c = this.boneTail[i];
+      const r = this.boneRadius[i] + BONE_MARGIN;
+      const ax = this.px[a], ay = this.py[a], az = this.pz[a];
+      const bx = this.px[c], by = this.py[c], bz = this.pz[c];
+      const minx = (ax < bx ? ax : bx) - r, maxx = (ax > bx ? ax : bx) + r;
+      const miny = (ay < by ? ay : by) - r, maxy = (ay > by ? ay : by) + r;
+      const minz = (az < bz ? az : bz) - r, maxz = (az > bz ? az : bz) + r;
+      for (let q = 0; q < n; q++) {
+        const tri = cand[q];
+        const b6 = tri * 6;
+        if (ta[b6] > maxx || ta[b6 + 3] < minx) continue;
+        if (ta[b6 + 1] > maxy || ta[b6 + 4] < miny) continue;
+        if (ta[b6 + 2] > maxz || ta[b6 + 5] < minz) continue;
+        if (k >= out.length) {
+          const bigger = new Int32Array(out.length * 2);
+          bigger.set(out);
+          this._bCand = out = bigger;
+        }
+        out[k++] = tri;
+      }
+    }
+    start[nb] = k;
+  }
+
+  /**
+   * Exact capsule/triangle contacts for every bone, from the doll-wide candidate
+   * list. Each contact is stored as the plane it pushes out of — normal, plane
+   * constant and the parameter along the bone axis — so later iterations can
+   * re-derive the penetration depth from the bone's *current* position with a
+   * single dot product instead of another distance test.
+   */
+  _buildContacts() {
+    const start = this._cStart;
+    const bStart = this._bStart;
+    const w = this.world;
+    if (bStart[this.boneCount] === 0) {
+      start.fill(0);
+      return;
+    }
+    const cand = this._bCand;
+    const ta = w.triAabb;
+    const pos = w.pos;
+    const nrm = w.nrm;
+    const cl = this._cl;
+    const cnx = this._cnx, cny = this._cny, cnz = this._cnz;
+    const cpd = this._cpd, cs = this._cs, cfric = this._cfric;
+    let k = 0;
+    for (let i = 0; i < this.boneCount; i++) {
+      start[i] = k;
+      const q0 = bStart[i], q1 = bStart[i + 1];
+      if (q1 <= q0) continue;
+      const a = this.boneHead[i], c = this.boneTail[i];
+      const r = this.boneRadius[i];
+      const ax = this.px[a], ay = this.py[a], az = this.pz[a];
+      const bx = this.px[c], by = this.py[c], bz = this.pz[c];
+      // Exact box for THIS bone at ITS CURRENT position — the bucket it reads
+      // from was built with a movement margin, and without narrowing it again
+      // here every bone would run the (expensive) segment/triangle distance
+      // function against a box ~100x its own volume. This test is the same one
+      // `queryAabb` applies at its leaves, so the triangle set that reaches the
+      // distance function is exactly the set the old per-bone query returned.
+      const minx = (ax < bx ? ax : bx) - r, maxx = (ax > bx ? ax : bx) + r;
+      const miny = (ay < by ? ay : by) - r, maxy = (ay > by ? ay : by) + r;
+      const minz = (az < bz ? az : bz) - r, maxz = (az > bz ? az : bz) + r;
+      const r2 = r * r;
+      const lim = k + MAX_BONE_CONTACTS;
+      for (let q = q0; q < q1 && k < lim; q++) {
+        const tri = cand[q];
+        const b6 = tri * 6;
+        if (ta[b6] > maxx || ta[b6 + 3] < minx) continue;
+        if (ta[b6 + 1] > maxy || ta[b6 + 4] < miny) continue;
+        if (ta[b6 + 2] > maxz || ta[b6 + 5] < minz) continue;
+        const p = tri * 9;
+        const d2 = segTriangleClosest(
+          ax, ay, az, bx, by, bz,
+          pos[p], pos[p + 1], pos[p + 2],
+          pos[p + 3], pos[p + 4], pos[p + 5],
+          pos[p + 6], pos[p + 7], pos[p + 8],
+          cl
+        );
+        if (d2 >= r2) continue;
+        const d = Math.sqrt(d2);
+        let nx, ny, nz;
+        if (d > 1e-6) {
+          nx = (cl.ax - cl.bx) / d;
+          ny = (cl.ay - cl.by) / d;
+          nz = (cl.az - cl.bz) / d;
+          // Deep contacts can pick a normal pointing into the solid; fall back to
+          // the face normal when the closest-point direction disagrees with it.
+          const fn = nx * nrm[tri * 3] + ny * nrm[tri * 3 + 1] + nz * nrm[tri * 3 + 2];
+          if (fn < 0.05) {
+            nx = nrm[tri * 3]; ny = nrm[tri * 3 + 1]; nz = nrm[tri * 3 + 2];
+          }
+        } else {
+          nx = nrm[tri * 3]; ny = nrm[tri * 3 + 1]; nz = nrm[tri * 3 + 2];
+        }
+        cnx[k] = nx; cny[k] = ny; cnz[k] = nz;
+        cpd[k] = nx * cl.bx + ny * cl.by + nz * cl.bz;
+        cs[k] = cl.s;
+        const sp = SURFACE_PROPS[w.surface[tri]];
+        cfric[k] = sp ? sp.friction : 0.7;
+        k++;
+      }
+    }
+    start[this.boneCount] = k;
+  }
+
   /** Capsule bones vs the static world, with friction against the previous position. */
   _solveContacts(applyFriction) {
     const w = this.world;
     if (!w || w.triCount === 0) return;
+    const start = this._cStart;
+    const cnx = this._cnx, cny = this._cny, cnz = this._cnz;
+    const cpd = this._cpd, cs = this._cs, cfric = this._cfric;
     for (let i = 0; i < this.boneCount; i++) {
+      const c0 = start[i], c1 = start[i + 1];
+      if (c1 <= c0) continue;
       const a = this.boneHead[i], c = this.boneTail[i];
       const r = this.boneRadius[i];
-      const n = w.overlapCapsule(
-        this.px[a], this.py[a], this.pz[a],
-        this.px[c], this.py[c], this.pz[c],
-        r, this.mask, 0
-      );
-      if (n === 0) continue;
-      const cts = w.contacts;
+      const ax = this.px[a], ay = this.py[a], az = this.pz[a];
+      const dxs = this.px[c] - ax, dys = this.py[c] - ay, dzs = this.pz[c] - az;
       let pushx = 0, pushy = 0, pushz = 0;
       let fric = 0.7;
       let param = 0;
       let wsum = 0;
-      for (let k = 0; k < n; k++) {
-        const d = cts.depth[k];
+      for (let k = c0; k < c1; k++) {
+        const nx = cnx[k], ny = cny[k], nz = cnz[k];
+        const s = cs[k];
+        // Re-project: how far the contact point on the bone axis now sits on the
+        // solid side of the cached plane.
+        const qx = ax + dxs * s, qy = ay + dys * s, qz = az + dzs * s;
+        const d = r - (qx * nx + qy * ny + qz * nz - cpd[k]);
         if (d <= 1e-5) continue;
-        const nx = cts.nx[k], ny = cts.ny[k], nz = cts.nz[k];
         // Accumulate the *maximum* push along each normal instead of the sum:
         // a tessellated floor would otherwise eject the bone into orbit.
         const already = pushx * nx + pushy * ny + pushz * nz;
@@ -450,10 +664,9 @@ export class Ragdoll {
           pushy += ny * extra;
           pushz += nz * extra;
         }
-        param += cts.s[k] * d;
+        param += s * d;
         wsum += d;
-        const sp = SURFACE_PROPS[w.surface[cts.tri[k]]];
-        if (sp) fric = sp.friction;
+        fric = cfric[k];
       }
       const pl = Math.hypot(pushx, pushy, pushz);
       if (pl < 1e-6) continue;

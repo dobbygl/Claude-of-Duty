@@ -84,6 +84,7 @@ import {
 
 const HIT_POOL = 64;
 const IMPACT_POOL = 48;
+const DAMAGE_POOL = 16;
 
 function makePublicHit() {
   return {
@@ -167,8 +168,6 @@ class Collider {
 
 const _v = new THREE.Vector3();
 const _m4 = new THREE.Matrix4();
-const _m4i = new THREE.Matrix4();
-const _one = new THREE.Vector3(1, 1, 1);
 
 const SKIP_NAME =
   /(sky|skybox|light|helper|gizmo|particle|decal|tracer|muzzle|viewmodel|hud|billboard|sprite|volumetric|godray|impostor)/i;
@@ -183,6 +182,8 @@ export class PhysicsSystem {
     this.characters = [];
     this.ragdolls = [];
     this.colliders = [];
+    /** Union of every live collider's layer bits — see _raycastColliders. */
+    this._colliderLayers = 0;
     this.ballistics = new Ballistics(this);
 
     this.LAYER = LAYER;
@@ -219,6 +220,17 @@ export class PhysicsSystem {
     this._impactCursor = 0;
     this._impactResult = [];
 
+    // `damage:dealt` used to be an object literal per connecting round — the
+    // same per-shot garbage `bullet:impact` was pooled to avoid. Same ring
+    // discipline: read it or copy it inside your handler, never stash it.
+    this._damagePool = [];
+    for (let i = 0; i < DAMAGE_POOL; i++) {
+      this._damagePool.push({
+        target: null, amount: 0, headshot: false, killed: false, point: null,
+      });
+    }
+    this._damageCursor = 0;
+
     this._raw = makeHitRecord();
     this._raw2 = makeHitRecord();
     this._cl = makeClosest();
@@ -244,6 +256,20 @@ export class PhysicsSystem {
     this.rng = ctx.rng.fork();
     this.ballistics.rng = this.rng;
     this.debug = new PhysicsDebugView(ctx.scene);
+
+    // Quality-driven rigid-body budget. `bodySubsteps` is 12 (the value the
+    // solver hardcoded) on every preset but `mobile`; the light-mass solver tier
+    // only exists there too, so nothing about debris behaviour moves elsewhere.
+    this._applyQuality();
+    // Re-applied on a runtime preset change. These two are the ONLY preset
+    // fields this subsystem can honour live: they are read at the top of each
+    // body's step, so the next step simply uses the new number. `physicsHz` is
+    // NOT here — `Engine` reads it once at construction, and the ragdoll contact
+    // cache's margins (CAND_MARGIN / BONE_MARGIN) are sized for how far a bone
+    // travels in ONE step, so changing the step under them is a correctness
+    // change, not a budget change. See the FASE 5 log entry.
+    this._onQuality = () => this._applyQuality();
+    ctx.events.on('ui:quality', this._onQuality);
 
     this._onExplosion = (e) => this.explode(e);
     this._onDeath = (e) => this._handleDeath(e);
@@ -467,6 +493,11 @@ export class PhysicsSystem {
   }
 
   _raycastColliders(ox, oy, oz, dx, dy, dz, best, mask, out) {
+    // Statics-only fast path. A MASK.WORLD query — every ground probe, every
+    // line-of-sight test, every vault probe — cannot hit an actor hitbox, but it
+    // still walked all 49 of them (7 per agent) testing layer bits one at a
+    // time. One AND against the union answers it for the whole list.
+    if ((mask & this._colliderLayers) === 0) return best;
     for (let i = 0; i < this.colliders.length; i++) {
       const c = this.colliders[i];
       if (!c.enabled || (c.layer & mask) === 0) continue;
@@ -523,11 +554,16 @@ export class PhysicsSystem {
       if (b.shape === 'sphere') {
         t = raySphere(ox, oy, oz, dx, dy, dz, b.position.x, b.position.y, b.position.z, b.radius, best);
       } else {
-        _m4.compose(b.position, b.quaternion, _one);
-        _m4i.copy(_m4).invert();
+        // Bounding-sphere reject first: an OBB test costs a compose, a 4x4
+        // inverse and a slab test, and with up to 96 pieces of debris live the
+        // overwhelming majority of them are nowhere near the ray.
+        if (raySphere(ox, oy, oz, dx, dy, dz, b.position.x, b.position.y, b.position.z, b.rayRadius, best) < 0) {
+          continue;
+        }
+        const inv = b.rayInverse().elements;
         t = b.shape === 'capsule'
-          ? rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.radius, b.halfHeight + b.radius, b.radius, best)
-          : rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.hx, b.hy, b.hz, best);
+          ? rayObb(ox, oy, oz, dx, dy, dz, inv, b.radius, b.halfHeight + b.radius, b.radius, best)
+          : rayObb(ox, oy, oz, dx, dy, dz, inv, b.hx, b.hy, b.hz, best);
       }
       if (t < 0 || t >= best) continue;
       best = t;
@@ -706,7 +742,15 @@ export class PhysicsSystem {
    * Returns an array of impact records (reused; copy what you keep).
    */
   fireBullet(opts) {
-    const n = this.ballistics.fire({ rng: this.rng, ...opts });
+    // No `{ rng, ...opts }` spread: that allocated a fresh object per round, and
+    // per penetrated layer in bursts. The generator moves to its own argument so
+    // the precedence is EXACTLY what the spread produced — an explicit
+    // `opts.rng` wins, otherwise this system's fork, and `ballistics.rng` is the
+    // last resort rather than the second. (A dev rig that swaps
+    // `physics.ballistics.rng` and expects it to take effect wants the spread's
+    // behaviour changed, not preserved — but that is a separate decision from a
+    // memory optimisation.)
+    const n = this.ballistics.fire(opts, this.rng);
     const res = this._impactResult;
     res.length = 0;
     for (let i = 0; i < n; i++) res.push(this.ballistics.impacts[i]);
@@ -730,13 +774,14 @@ export class PhysicsSystem {
     this.ctx.events.emit('bullet:impact', p);
 
     if (p.actor && !exit) {
-      this.ctx.events.emit('damage:dealt', {
-        target: p.actor,
-        amount: damage * (hit?.collider?.damageScale ?? 1),
-        headshot: hit?.part === 'head',
-        killed: false,
-        point: p.point,
-      });
+      const d = this._damagePool[this._damageCursor];
+      this._damageCursor = (this._damageCursor + 1) % DAMAGE_POOL;
+      d.target = p.actor;
+      d.amount = damage * (hit?.collider?.damageScale ?? 1);
+      d.headshot = hit?.part === 'head';
+      d.killed = false;
+      d.point = p.point;
+      this.ctx.events.emit('damage:dealt', d);
     }
   }
 
@@ -871,12 +916,18 @@ export class PhysicsSystem {
   addCollider(opts = {}) {
     const c = new Collider(opts);
     this.colliders.push(c);
+    this._colliderLayers |= c.layer;
     return c;
   }
 
   removeCollider(c) {
     const i = this.colliders.indexOf(c);
     if (i >= 0) this.colliders.splice(i, 1);
+    // The union is only ever used to reject whole-list scans, so recomputing it
+    // on removal (rare — actors dying) keeps it exact rather than sticky.
+    let m = 0;
+    for (let k = 0; k < this.colliders.length; k++) m |= this.colliders[k].layer;
+    this._colliderLayers = m;
   }
 
   /* ================================================================== */
@@ -884,7 +935,11 @@ export class PhysicsSystem {
   /* ================================================================== */
 
   fixedUpdate(h, ctx) {
-    const t0 = performance.now();
+    // `performance.now()` is a syscall-ish read on some mobile browsers and this
+    // is the one function that runs up to 8 times a frame; the number it feeds
+    // is a debug stat, so only pay for it when something is looking.
+    const timed = this.debug?.enabled === true;
+    const t0 = timed ? performance.now() : 0;
 
     if (this._explicitStatics === 0) {
       this._autoScanTimer += h;
@@ -906,7 +961,7 @@ export class PhysicsSystem {
     this.bodies.step(h);
     for (let i = 0; i < this.ragdolls.length; i++) this.ragdolls[i].step(h);
 
-    this.stats.stepMs = performance.now() - t0;
+    if (timed) this.stats.stepMs = performance.now() - t0;
     this.stats.awake = this.bodies.awakeCount;
     this.stats.raycasts = this._rayCount;
     this._rayCount = 0;
@@ -1025,9 +1080,17 @@ export class PhysicsSystem {
     return this.stats;
   }
 
+  /** Rigid-body budget from the active preset. See the note in `init`. */
+  _applyQuality() {
+    const q = this.ctx?.config?.q;
+    this.bodies.maxSubsteps = q?.bodySubsteps > 0 ? q.bodySubsteps : 12;
+    this.bodies.lightMassThreshold = q?.bodySubsteps <= 4 ? 0.05 : 0;
+  }
+
   dispose() {
     this.ctx?.events.off('explosion', this._onExplosion);
     this.ctx?.events.off('actor:death', this._onDeath);
+    this.ctx?.events.off('ui:quality', this._onQuality);
     this.debug?.dispose();
     this.debug = null;
     this.bodies.clear();
@@ -1035,6 +1098,7 @@ export class PhysicsSystem {
     this.ragdolls.length = 0;
     this.characters.length = 0;
     this.colliders.length = 0;
+    this._colliderLayers = 0;
     this.staticWorld.dispose();
   }
 }

@@ -30,6 +30,10 @@ class Projectile {
     this.dropoff = 0.5;
     this.weapon = null;
     this.mask = undefined;
+    /** Position the last swept collision test started from. */
+    this.check = new THREE.Vector3();
+    /** Steps integrated since that test. */
+    this.pending = 0;
   }
 }
 
@@ -40,6 +44,7 @@ export class ProjectileSim {
     for (let i = 0; i < MAX_LIVE; i++) this.pool.push(new Projectile());
     this.live = [];
     this._seg = new THREE.Vector3();
+    this._sweep = new THREE.Vector3();
     this._hitDir = new THREE.Vector3();
     this._tracerFrom = new THREE.Vector3();
     this._tracerTo = new THREE.Vector3();
@@ -73,6 +78,8 @@ export class ProjectileSim {
     p.alive = true;
     p.pos.copy(o.origin);
     p.prev.copy(o.origin);
+    p.check.copy(o.origin);
+    p.pending = 0;
     p.dir.copy(o.dir).normalize();
     p.vel.copy(p.dir).multiplyScalar(o.speed ?? 800);
     p.damage = o.damage ?? 30;
@@ -106,8 +113,23 @@ export class ProjectileSim {
     this.ctx.events.emit('bullet:tracer', this._tracerPayload);
   }
 
+  /**
+   * How many fixed steps a round integrates between collision tests.
+   *
+   * The test is a swept segment from where the last one ended to where the round
+   * is now, so a stride of 2 does not open a gap and cannot tunnel — it only
+   * replaces the true (very slightly curved) path over those two steps with its
+   * chord, which at 120 Hz is a 0.3 mm deviation, and delays an impact by at
+   * most one step (8 ms). At 60 Hz or slower the step is already long enough
+   * that halving the test rate would be visible, so it stays at 1.
+   */
+  _stride(h) {
+    return h <= 1 / 90 ? 2 : 1;
+  }
+
   fixedUpdate(h) {
     const phys = this.physics;
+    const stride = this._stride(h);
     for (let i = this.live.length - 1; i >= 0; i--) {
       const p = this.live[i];
       p.prev.copy(p.pos);
@@ -119,34 +141,44 @@ export class ProjectileSim {
       p.age += h;
 
       this._seg.copy(p.pos).sub(p.prev);
-      const segLen = this._seg.length();
-      p.travelled += segLen;
+      p.travelled += this._seg.length();
+      p.pending++;
 
-      if (segLen > 1e-6 && phys) {
-        this._hitDir.copy(this._seg).divideScalar(segLen);
-        const hit = phys.raycast(p.prev, this._hitDir, segLen, phys.MASK?.BULLET);
-        if (hit?.hit) {
-          // Contact: hand the round to the penetration solver, which emits
-          // `bullet:impact` for every entry and exit face it goes through.
-          const range01 = Math.min(1, p.travelled / p.maxRange);
-          const falloff = 1 - (1 - p.dropoff) * range01 * range01;
-          phys.fireBullet({
-            origin: p.prev,
-            dir: this._hitDir,
-            maxDist: Math.min(24, Math.max(1.5, p.maxRange - p.travelled + segLen)),
-            damage: p.damage * falloff,
-            penetration: p.penetration,
-            dropoff: 1,
-            mask: p.mask,
-          });
-          this.stats.impacts++;
-          this._retire(p);
-          this.live.splice(i, 1);
-          continue;
+      // A round that is about to be retired always gets its last segment tested
+      // first, so decimation can never swallow an impact.
+      const expiring = p.travelled > p.maxRange || p.age > 5 || p.pos.y < -80;
+
+      if (phys && (p.pending >= stride || expiring)) {
+        this._sweep.copy(p.pos).sub(p.check);
+        const segLen = this._sweep.length();
+        if (segLen > 1e-6) {
+          this._hitDir.copy(this._sweep).divideScalar(segLen);
+          const hit = phys.raycast(p.check, this._hitDir, segLen, phys.MASK?.BULLET);
+          if (hit?.hit) {
+            // Contact: hand the round to the penetration solver, which emits
+            // `bullet:impact` for every entry and exit face it goes through.
+            const range01 = Math.min(1, p.travelled / p.maxRange);
+            const falloff = 1 - (1 - p.dropoff) * range01 * range01;
+            phys.fireBullet({
+              origin: p.check,
+              dir: this._hitDir,
+              maxDist: Math.min(24, Math.max(1.5, p.maxRange - p.travelled + segLen)),
+              damage: p.damage * falloff,
+              penetration: p.penetration,
+              dropoff: 1,
+              mask: p.mask,
+            });
+            this.stats.impacts++;
+            this._retire(p);
+            this.live.splice(i, 1);
+            continue;
+          }
         }
+        p.check.copy(p.pos);
+        p.pending = 0;
       }
 
-      if (p.travelled > p.maxRange || p.age > 5 || p.pos.y < -80) {
+      if (expiring) {
         this._retire(p);
         this.live.splice(i, 1);
       }

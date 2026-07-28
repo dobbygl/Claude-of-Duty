@@ -29,6 +29,28 @@ import { BORE_DIR } from './rig.js';
 
 const DEG = Math.PI / 180;
 
+const _rotM = new THREE.Matrix4();
+
+/**
+ * World rotation of an object whose `matrixWorld` is already current.
+ *
+ * `Object3D.getWorldQuaternion()` cannot assume that, so it first calls
+ * `updateWorldMatrix(true, false)` — which walks to the scene root and
+ * re-multiplies every ancestor's world matrix — and then runs a full
+ * `decompose()`. The IK solvers below called it 16-20 times per actor per frame
+ * on a chain that the animator itself has just made current, so the walk was
+ * pure repetition. Reading the matrix directly is the same arithmetic as
+ * decompose's rotation part (both normalise the basis by the column lengths),
+ * so this is bit-identical for the uniformly-scaled actor group.
+ *
+ * The invariant it needs: every caller either has not moved anything since the
+ * last `updateMatrixWorld`, or is reading a bone at or below one that
+ * `_applyWorld` has just refreshed. Keep it that way.
+ */
+function worldQuatOf(obj, out) {
+  return out.setFromRotationMatrix(_rotM.extractRotation(obj.matrixWorld));
+}
+
 /** Pose accumulator handed to clip functions. */
 class Poser {
   constructor(rig) {
@@ -127,6 +149,14 @@ export class Animator {
       [rig.index('UpLegR'), rig.index('LegR'), rig.index('FootR')],
       [rig.index('UpLegL'), rig.index('LegL'), rig.index('FootL')],
     ];
+    /* IK chains, hoisted: these were array literals rebuilt inside _aimIk and
+     * _lookAt, i.e. four allocations per actor per frame in the hot path. Plain
+     * arrays, not typed ones — the weights must stay float64 or the solve is no
+     * longer the same arithmetic. */
+    this._aimChain = [this.iSpine, this.iSpine1, this.iSpine2];
+    this._aimWeights = [0.12, 0.34, 0.54];
+    this._lookChain = [this.iNeck, this.iHead];
+    this._lookWeights = [0.4, 0.6];
 
     /* ---- weapon anchors, expressed in HandR bind-local space ---- */
     const qInv = rig.bindQuat[this.iHandR].clone().invert();
@@ -158,6 +188,8 @@ export class Animator {
     this._target = new THREE.Vector3();
     this._up = new THREE.Vector3(0, 1, 0);
     this._probeOut = { y: 0, nx: 0, ny: 1, nz: 0, hit: false };
+    /** World rotation of the actor group, refreshed once per update(). */
+    this._rootQ = new THREE.Quaternion();
     this._footY = [0, 0];
     this._footN = [new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 1, 0)];
     this._aimApplied = 0;
@@ -290,6 +322,11 @@ export class Animator {
     /* --- IK --- */
     const root = this.bones[0];
     root.updateMatrixWorld(true);
+    // The actor group's rotation is constant for the whole pass and three of the
+    // IK stages want it; resolving it once here saves three ancestor walks and
+    // three decomposes per actor per frame.
+    if (root.parent) worldQuatOf(root.parent, this._rootQ);
+    else this._rootQ.identity();
 
     if (this.footIk && !this.vaulting) this._footIk();
     if (st.aimTarget && st.aimWeight > 0.01 && !this.vaulting) this._aimIk(st.aimTarget, st.aimWeight);
@@ -331,7 +368,7 @@ export class Animator {
   }
 
   _wq(i, out) {
-    return this.bones[i].getWorldQuaternion(out);
+    return worldQuatOf(this.bones[i], out);
   }
 
   /** Rotate bone `i` in world space by quaternion `dq`, keeping its position. */
@@ -341,7 +378,7 @@ export class Animator {
     // NOTE: private scratch — callers pass their own quaternions in as `dq`,
     // so this must never reuse the shared _q/_q2/_q3 slots.
     const q = this._qa;
-    if (parent) parent.getWorldQuaternion(q);
+    if (parent) worldQuatOf(parent, q);
     else q.identity();
     const cur = this._qb.copy(q).multiply(b.quaternion); // current world
     cur.premultiply(dq);
@@ -363,11 +400,8 @@ export class Animator {
   /* ---------------- A: aim ---------------- */
 
   _aimIk(target, weight) {
-    const spread = [
-      [this.iSpine, 0.12],
-      [this.iSpine1, 0.34],
-      [this.iSpine2, 0.54],
-    ];
+    const chain = this._aimChain;
+    const weights = this._aimWeights;
     for (let iter = 0; iter < 2; iter++) {
       const hand = this.bones[this.iHandR];
       const bore = this._v.copy(this.boreLocal).applyQuaternion(this._wq(this.iHandR, this._q2)).normalize();
@@ -384,9 +418,9 @@ export class Animator {
       const axis = this._v4.crossVectors(bore, want);
       if (axis.lengthSq() < 1e-10) return;
       axis.normalize();
-      for (const [bi, f] of spread) {
-        this._q3.setFromAxisAngle(axis, ang * f);
-        this._applyWorld(bi, this._q3);
+      for (let k = 0; k < chain.length; k++) {
+        this._q3.setFromAxisAngle(axis, ang * weights[k]);
+        this._applyWorld(chain[k], this._q3);
       }
     }
   }
@@ -395,11 +429,11 @@ export class Animator {
 
   _lookAt(target, weight) {
     // the head's forward is its local +Z
-    const chain = [
-      [this.iNeck, 0.4],
-      [this.iHead, 0.6],
-    ];
-    for (const [bi, f] of chain) {
+    const chain = this._lookChain;
+    const weights = this._lookWeights;
+    for (let k = 0; k < chain.length; k++) {
+      const bi = chain[k];
+      const f = weights[k];
       const wq = this._wq(bi, this._q2);
       const fwd = this._v.set(0, 0, 1).applyQuaternion(wq);
       const want = this._v2.copy(target).sub(this._wp(bi, this._v3));
@@ -439,7 +473,7 @@ export class Animator {
       t.copy(this.foregripLocal).applyMatrix4(hand.matrixWorld);
     }
     // pole: elbow down and out to the character's left
-    this._pole.set(0.6, -1, -0.25).applyQuaternion(this.bones[0].parent.getWorldQuaternion(this._q2));
+    this._pole.set(0.6, -1, -0.25).applyQuaternion(this._rootQ);
     this._twoBone(this.armL, t, this._pole);
   }
 
@@ -476,9 +510,7 @@ export class Animator {
       const ankle = this._wp(leg[2], this._v);
       const target = this._target.set(ankle.x, Math.max(this._footY[k], ankle.y - 0.001), ankle.z);
       // knee pole: forward, in the actor's facing
-      this._pole
-        .set(k === 0 ? -0.12 : 0.12, 0.05, 1)
-        .applyQuaternion(this.bones[0].parent.getWorldQuaternion(this._q2));
+      this._pole.set(k === 0 ? -0.12 : 0.12, 0.05, 1).applyQuaternion(this._rootQ);
       this._twoBone(leg, target, this._pole);
       // roll the sole onto the ground plane
       const n = this._footN[k];
@@ -548,12 +580,17 @@ export class Animator {
     this.ejectWorld.copy(this.ejectLocal).applyMatrix4(hand.matrixWorld);
     this.muzzleDir
       .copy(this.boreLocal)
-      .applyQuaternion(hand.getWorldQuaternion(this._q2))
+      .applyQuaternion(worldQuatOf(hand, this._q2))
       .normalize();
   }
 
   /** World position of a bone, for hitboxes and FX. */
   bonePos(name, out) {
     return this._wp(this.rig.index(name), out);
+  }
+
+  /** Same, by rig index — for callers that resolved the name once (hitboxes). */
+  bonePosAt(i, out) {
+    return this._wp(i, out);
   }
 }

@@ -10,7 +10,7 @@ import { Rng } from './rng.js';
  *
  * Frame order:
  *   1. input.beginFrame()
- *   2. fixedUpdate(FIXED_DT) xN   — physics, deterministic gameplay
+ *   2. fixedUpdate(engine.fixedDt) xN — physics, deterministic gameplay
  *   3. update(dt)                 — animation, cameras, AI decisions
  *   4. lateUpdate(dt)             — anything that must observe final transforms
  *   5. render subsystem draws
@@ -25,6 +25,17 @@ export class Engine {
     this.input = new Input(canvas, config);
     this.rng = new Rng(config.deterministic ? 0x5eed1234 : (Math.random() * 2 ** 32) >>> 0);
 
+    /**
+     * Fixed step, in seconds. Sourced from the quality preset ONCE, here, and
+     * never again: every subsystem's damping, friction and integration constants
+     * are parameterised on the `h` it is handed, but a few caches (contact
+     * lists, animation phase accumulators) assume the step does not change under
+     * them mid-session. Changing the rate at runtime is a FASE 5 problem.
+     * Deterministic capture runs are unaffected as long as the preset is fixed.
+     */
+    const hz = config?.q?.physicsHz;
+    this.fixedDt = Number.isFinite(hz) && hz > 0 ? 1 / hz : FIXED_DT;
+
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(config.fov, 1, 0.05, 1200);
     this.camera.rotation.order = 'YXZ';
@@ -38,7 +49,7 @@ export class Engine {
       /** Seconds since start, scaled. */ elapsed: 0,
       /** Unscaled wall-clock seconds since start. */ raw: 0,
       /** Last frame delta, scaled and clamped. */ dt: 0,
-      /** Fixed step. */ fixed: FIXED_DT,
+      /** Fixed step. Read this, never the FIXED_DT module constant. */ fixed: this.fixedDt,
       /** Interpolation alpha between the last two physics steps, 0..1. */ alpha: 0,
       scale: 1,
       frame: 0,
@@ -131,13 +142,20 @@ export class Engine {
     this._accum += t.dt;
     let steps = 0;
     const fixedSystems = this.registry.with('fixedUpdate');
-    while (this._accum >= FIXED_DT && steps < MAX_SUBSTEPS) {
-      for (const sys of fixedSystems) sys.fixedUpdate(FIXED_DT, this.ctx);
-      this._accum -= FIXED_DT;
+    const h = this.fixedDt;
+    while (this._accum >= h && steps < MAX_SUBSTEPS) {
+      for (const sys of fixedSystems) sys.fixedUpdate(h, this.ctx);
+      this._accum -= h;
       steps++;
     }
-    if (steps === MAX_SUBSTEPS) this._accum = 0; // shed backlog rather than spiral
-    t.alpha = this._accum / FIXED_DT;
+    // Shed the backlog rather than spiral — but ONLY when there really is one.
+    // The old test fired on `steps === MAX_SUBSTEPS` alone, which is also what a
+    // frame that legitimately needed all 8 steps and drained the accumulator on
+    // the last one looks like. Throwing the remainder away there loses up to a
+    // full step of simulation time and, worse, zeroes `alpha`, so the render
+    // interpolation snaps back on exactly the frames that are already long.
+    if (steps === MAX_SUBSTEPS && this._accum >= h) this._accum = 0;
+    t.alpha = this._accum / h;
 
     for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
     for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
