@@ -9,9 +9,23 @@ import { el, setText, setStyle, setClass, clamp01, damp, ease, lerp } from './ut
  *   on hit       a 180ms directional-agnostic red flash
  *   regen        vignette breathes out over ~2s and saturation returns
  *
- * The vignette is two stacked layers pushed through an feTurbulence
- * displacement filter (see style.js) so its edge is organic; a clean radial
- * gradient is the single most "WebGL demo" thing a hurt overlay can do.
+ * THE SCREEN-SPACE PART IS NOT DOM ANY MORE. It used to be five stacked
+ * full-screen layers: a `backdrop-filter` for the desaturation, two gradients
+ * pushed through an feTurbulence/feDisplacementMap SVG filter for the blood
+ * vignette, and two `mix-blend-mode` layers for the heartbeat ring and the hit
+ * flash. Every one of those reads the pixels *underneath* it, and what is
+ * underneath is a canvas that redraws every frame — so none of them could ever
+ * be cached in a composited layer. The browser had to read back the whole
+ * framebuffer, run a filter graph over it and recomposite, on every frame, for
+ * as long as the player was hurt, which is most of a firefight.
+ *
+ * All four amounts are now published as plain numbers (`desatA`, `bloodA`,
+ * `flashA`, `beatA`) and pushed into the render composite by `src/ui/index.js`
+ * via `RenderSystem.setHurt`, where they are a handful of ALU ops on a value the
+ * pass already has in a register. The organic vignette edge — which is the whole
+ * reason the DOM version paid for a turbulence filter, because a clean radial
+ * ramp is the single most "WebGL demo" thing a hurt overlay can do — is
+ * reproduced there with two octaves of value noise.
  *
  * The vitals widget lives in the bottom-LEFT of the safe area — the mirror of
  * the ammo block — because it holds the most important number on the screen and
@@ -21,18 +35,10 @@ import { el, setText, setStyle, setClass, clamp01, damp, ease, lerp } from './ut
  * readout, a genuinely dark track behind the empty segments, and a visually
  * distinct armour row underneath.
  *
- * @param {HTMLElement} parent      full-screen layer for the hurt overlays
- * @param {HTMLElement} [chrome]    layer for the widget (fades with the HUD)
+ * @param {HTMLElement} chrome  layer for the widget (fades with the HUD)
  */
 export class HealthFx {
-  constructor(parent, chrome = parent) {
-    this.bloodWrap = el('div', 'ow-blood', parent);
-    el('div', 'ow-blood-a', this.bloodWrap);
-    el('div', 'ow-blood-b', this.bloodWrap);
-    this.beat = el('div', 'ow-lowbeat', parent);
-    this.desat = el('div', 'ow-desat', parent);
-    this.flash = el('div', 'ow-hitflash', parent);
-
+  constructor(chrome) {
     // ---- vitals widget ----------------------------------------------------
     this.vitals = el('div', 'ow-vitals', chrome);
     const head = el('div', 'ow-vt-head', this.vitals);
@@ -64,10 +70,15 @@ export class HealthFx {
     this._lastBeat = 0;
     this.onBeat = null; // set by index for the audio cue
 
-    setStyle(this.bloodWrap, 'opacity', '0');
-    setStyle(this.desat, 'display', 'none');
-    setStyle(this.flash, 'opacity', '0');
-    setStyle(this.beat, 'opacity', '0');
+    /**
+     * Screen-space hurt amounts, 0..1, read once a frame by `src/ui/index.js`
+     * and handed to `RenderSystem.setHurt`. All four at zero is the exact no-op
+     * path in the composite shader.
+     */
+    this.desatA = 0;
+    this.bloodA = 0;
+    this.flashA = 0;
+    this.beatA = 0;
   }
 
   onDamage(intensity = 1) {
@@ -108,30 +119,16 @@ export class HealthFx {
 
     // --- regeneration breath ---------------------------------------------
     if (this.regenT < 1) this.regenT = Math.min(1, this.regenT + dt / 1.8);
-    const regenPulse = s.regen ? 0.12 * (1 - ease.outCubic(this.regenT)) : 0;
 
-    const bloodA = clamp01(hurt * 1.05 + this.beatEnergy * 0.16);
-    setStyle(this.bloodWrap, 'opacity', bloodA.toFixed(3));
-    setStyle(this.bloodWrap, 'display', bloodA < 0.004 ? 'none' : '');
-    const bs = 1 + this.beatEnergy * 0.022 + regenPulse * 0.12;
-    setStyle(this.bloodWrap, 'transform', `scale(${bs.toFixed(4)})`);
-
-    const beatA = clamp01(this.beatEnergy * 0.55);
-    setStyle(this.beat, 'opacity', beatA.toFixed(3));
-    setStyle(this.beat, 'display', beatA < 0.004 ? 'none' : '');
-
-    // backdrop-filter is expensive: only mount the element when it does work
-    const desatA = clamp01(hurt * 0.8);
-    setStyle(this.desat, 'display', desatA < 0.01 ? 'none' : '');
-    setStyle(this.desat, 'opacity', desatA.toFixed(3));
-
+    // --- screen-space amounts, published to the render composite ----------
+    this.bloodA = clamp01(hurt * 1.05 + this.beatEnergy * 0.16);
+    this.beatA = clamp01(this.beatEnergy * 0.55);
+    this.desatA = clamp01(hurt * 0.8);
     if (this.flashT < 1) {
       this.flashT = Math.min(1, this.flashT + dt / 0.19);
-      const a = (this.flashPeak ?? 1) * (1 - ease.outQuad(this.flashT)) * 0.8;
-      setStyle(this.flash, 'opacity', a.toFixed(3));
-      setStyle(this.flash, 'display', '');
+      this.flashA = clamp01((this.flashPeak ?? 1) * (1 - ease.outQuad(this.flashT)) * 0.8);
     } else {
-      setStyle(this.flash, 'display', 'none');
+      this.flashA = 0;
     }
 
     // --- vitals readout ---------------------------------------------------
@@ -169,10 +166,6 @@ export class HealthFx {
   }
 
   dispose() {
-    this.bloodWrap.remove();
-    this.beat.remove();
-    this.desat.remove();
-    this.flash.remove();
     this.vitals.remove();
   }
 }

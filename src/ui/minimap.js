@@ -22,7 +22,13 @@ const HEIGHT_RANGE = CAM_Y; // metres of vertical range mapped into the height r
  * publishes via `getHudActors()`.
  */
 export class Minimap {
-  constructor(parent, rng) {
+  /**
+   * @param {boolean} [throttle] draw at ~20 Hz instead of every frame. OFF in a
+   *   deterministic (capture) session: the blips come from live AI positions, so
+   *   skipping a frame there would move pixels in the shot gate for a reason
+   *   that is not a regression.
+   */
+  constructor(parent, rng, throttle = false) {
     this.root = el('div', 'ow-minimap', parent);
     this.canvas = el('canvas', null, this.root);
     this.g = this.canvas.getContext('2d');
@@ -42,6 +48,15 @@ export class Minimap {
     this.baked = null;
     this.bakeTries = 0;
     this.bakeDone = false;
+
+    this.throttle = !!throttle;
+    this._tick = 0;
+    // The two radial gradients depend only on the canvas size, and building a
+    // CanvasGradient allocates. Two allocations per frame is two per frame too
+    // many (ARCHITECTURE.md), so they are built once per size instead.
+    this._gradSize = 0;
+    this._coneGrad = null;
+    this._edgeGrad = null;
 
     this._rt = null;
     this._pixels = null;
@@ -442,6 +457,15 @@ export class Minimap {
     const g = this.g;
     const S = this.px;
     if (!S) return;
+    // 20 Hz. The map is north-up and the player walks; nothing on it can move
+    // far enough in 33 ms to read as a stutter, and it is two thirds less
+    // Canvas2D work — including the shadowBlur passes, which are the expensive
+    // part of every blip and of the player arrow.
+    if (this.throttle) {
+      this._tick = (this._tick + 1) % 3;
+      if (this._tick !== 0) return;
+    }
+    this._ensureGradients(S);
     const half = S * 0.5;
     const ppm = S / this.viewSpan; // canvas pixels per metre
 
@@ -500,11 +524,7 @@ export class Minimap {
     const heading = ((s.heading ?? 0) * Math.PI) / 180;
     const fov = (((s.fov ?? 80) * 0.5) * Math.PI) / 180;
     const coneR = S * 0.42;
-    const grad = g.createRadialGradient(half, half, 2, half, half, coneR);
-    grad.addColorStop(0, 'rgba(222,242,255,.26)');
-    grad.addColorStop(0.7, 'rgba(222,242,255,.075)');
-    grad.addColorStop(1, 'rgba(214,238,255,0)');
-    g.fillStyle = grad;
+    g.fillStyle = this._coneGrad;
     g.beginPath();
     g.moveTo(half, half);
     g.arc(half, half, coneR, -Math.PI / 2 + heading - fov, -Math.PI / 2 + heading + fov);
@@ -586,13 +606,33 @@ export class Minimap {
     g.restore();
 
     // edge falloff so the map sinks into the frame instead of ending abruptly
-    const vg = g.createRadialGradient(half, half, S * 0.28, half, half, S * 0.72);
-    vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(1, 'rgba(0,0,0,.17)');
-    g.fillStyle = vg;
+    g.fillStyle = this._edgeGrad;
     g.fillRect(0, 0, S, S);
 
     g.restore();
+  }
+
+  /**
+   * Both gradients are centred on the canvas and scale with it, so they are a
+   * pure function of `S` — and every fill using them happens at the identity
+   * transform, so caching them is pixel-exact.
+   */
+  _ensureGradients(S) {
+    if (this._gradSize === S) return;
+    this._gradSize = S;
+    const g = this.g;
+    const half = S * 0.5;
+
+    const cone = g.createRadialGradient(half, half, 2, half, half, S * 0.42);
+    cone.addColorStop(0, 'rgba(222,242,255,.26)');
+    cone.addColorStop(0.7, 'rgba(222,242,255,.075)');
+    cone.addColorStop(1, 'rgba(214,238,255,0)');
+    this._coneGrad = cone;
+
+    const edge = g.createRadialGradient(half, half, S * 0.28, half, half, S * 0.72);
+    edge.addColorStop(0, 'rgba(0,0,0,0)');
+    edge.addColorStop(1, 'rgba(0,0,0,.17)');
+    this._edgeGrad = edge;
   }
 
   dispose() {

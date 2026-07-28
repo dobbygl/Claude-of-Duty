@@ -72,18 +72,23 @@ export class UiSystem {
     const host = document.getElementById('ui') ?? document.body;
     this.root = el('div', 'ow-hud', host);
 
-    // Stacking order: hurt overlays sit under the HUD, the menu over everything.
-    this.hurtLayer = el('div', 'ow-layer', this.root);
+    // Stacking order: world markers under the reticle, chrome over both, the
+    // menu over everything. There is no hurt layer any more — the blood
+    // vignette, heartbeat, hit flash and desaturation are drawn by the render
+    // composite (see `_render.setHurt` in lateUpdate and src/ui/health.js).
     this.worldLayer = el('div', 'ow-layer', this.root);
     this.centreLayer = el('div', 'ow-layer', this.root);
     this.chromeLayer = el('div', 'ow-layer', this.root);
 
-    this.health = new HealthFx(this.hurtLayer, this.chromeLayer);
+    /** Cached because the hurt state is pushed once every single frame. */
+    this._render = ctx.peek('render') ?? null;
+
+    this.health = new HealthFx(this.chromeLayer);
     this.markers = new WorldMarkers(this.worldLayer, this.rng.fork());
     this.arcs = new DamageArcs(this.centreLayer);
     this.crosshair = new Crosshair(this.centreLayer);
     this.hit = new Hitmarkers(this.centreLayer);
-    this.minimap = new Minimap(this.chromeLayer, this.rng.fork());
+    this.minimap = new Minimap(this.chromeLayer, this.rng.fork(), !ctx.config.deterministic);
     this.compass = new Compass(this.chromeLayer);
     this.matchBar = new MatchBar(this.chromeLayer);
     this.killfeed = new Killfeed(this.chromeLayer);
@@ -91,6 +96,30 @@ export class UiSystem {
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
     this.menu = new PauseMenu(this.root, ctx);
+
+    // ---- portrait interstitial ------------------------------------------
+    // Touch devices only, and never in a capture session. Added after the menu
+    // so it is last in DOM order as well as above it by z-index.
+    this.rotate = null;
+    this._lockOrientation = null;
+    if (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0 && !ctx.config.deterministic) {
+      this.rotate = el('div', 'ow-rotate', this.root);
+      el('div', 'ow-rotate-icon', this.rotate);
+      el('div', 'ow-rotate-t', this.rotate, 'Rotate your device');
+      el('div', 'ow-rotate-s', this.rotate, 'Overwatch is played in landscape');
+      // Attempted, never required: locking needs a user gesture and usually
+      // fullscreen, and iOS Safari has no Screen Orientation lock at all. The
+      // interstitial above is the part that has to work everywhere.
+      this._lockOrientation = () => {
+        try {
+          const p = screen.orientation?.lock?.('landscape');
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch {
+          /* not permitted here — the interstitial still asks */
+        }
+      };
+      addEventListener('pointerdown', this._lockOrientation, { passive: true });
+    }
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
 
@@ -507,6 +536,10 @@ export class UiSystem {
     this.hit.update(dt);
     this.arcs.update(dt, rx, rz, fx, fz);
     this.health.update(dt, s);
+    // The screen-space hurt state is drawn by the render composite, not by DOM
+    // layers over the canvas — see RenderSystem.setHurt and src/ui/health.js.
+    // All four zero is the no-op path, so a healthy player costs one compare.
+    this._render?.setHurt?.(this.health.desatA, this.health.bloodA, this.health.flashA, this.health.beatA);
     this.ammo.update(dt, s);
     this.killfeed.update(dt);
     this.matchBar.update(s);
@@ -584,8 +617,14 @@ export class UiSystem {
   resize(w, h, ctx) {
     this.vw = w;
     this.vh = h;
-    this.k = clamp(h / 1080, 0.62, 2.4);
+    // Scale off the SHORTER edge, not the height. In landscape the two are the
+    // same number, so nothing on a desktop or in the capture harness moves; in
+    // portrait, height is the long edge and driving the HUD from it sized every
+    // widget against a dimension the screen does not have to spare — the compass
+    // tape alone came out wider than the phone.
+    this.k = clamp(Math.min(w, h) / 1080, 0.62, 2.4);
     this.root.style.setProperty('--k', this.k.toFixed(4));
+    if (this.rotate) setStyle(this.rotate, 'display', h > w ? 'flex' : 'none');
     this.crosshair.setScale(this.k);
     this.compass.setScale(this.k);
     this.minimap.resize(this.k);
@@ -594,6 +633,9 @@ export class UiSystem {
   dispose() {
     for (const off of this._unsubs) off();
     this._unsubs.length = 0;
+    // Leave no red screen behind: the uniform outlives this subsystem.
+    this._render?.setHurt?.(0, 0, 0, 0);
+    if (this._lockOrientation) removeEventListener('pointerdown', this._lockOrientation);
     this.crosshair.dispose();
     this.hit.dispose();
     this.arcs.dispose();

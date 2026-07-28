@@ -1,10 +1,18 @@
 /**
- * Input aggregation: keyboard, mouse (pointer-locked), and gamepad, exposed as
- * a stable per-frame snapshot so gameplay never touches raw DOM events.
+ * Input aggregation: keyboard, mouse (pointer-locked), gamepad and touch,
+ * exposed as a stable per-frame snapshot so gameplay never touches raw DOM
+ * events.
  *
  * Edge queries (`pressed`, `released`) are valid only during the frame in which
  * the transition happened — read them in update(), not fixedUpdate().
+ *
+ * All four devices converge on the SAME two channels, which is why no gameplay
+ * system knows how many of them exist: held action codes (`down`, fed by
+ * `_pendingDown`/`_pendingUp`) and analog state (`look`, `stick`). The on-screen
+ * controls in `./touch.js` write into exactly those and change no API here.
  */
+
+import { TouchControls } from './touch.js';
 
 export const ACTIONS = {
   forward: ['KeyW', 'ArrowUp'],
@@ -25,6 +33,32 @@ export const ACTIONS = {
   flashlight: ['KeyT'],
   pause: ['Escape'],
 };
+
+const EMPTY_PADS = [];
+const padDeadzone = (v) => (Math.abs(v) < 0.16 ? 0 : (v - Math.sign(v) * 0.16) / 0.84);
+const padCurve = (v) => Math.sign(v) * Math.abs(v) ** 2.4;
+
+/**
+ * Standard-mapping gamepad buttons, as `[index, action code]`. The pad used to
+ * publish axes and nothing else, which meant a controller could walk and look
+ * but could not shoot, jump, reload, or open the menu.
+ *
+ * Layout follows the console shooter convention: triggers fire and aim, face
+ * buttons jump / crouch / reload / swap, sticks sprint and melee.
+ */
+const PAD_BUTTONS = [
+  [0, 'Space'], // A      jump
+  [1, 'ControlLeft'], // B      crouch
+  [2, 'KeyR'], // X      reload
+  [3, 'Tab'], // Y      swap weapon
+  [4, 'KeyF'], // LB     use
+  [5, 'KeyG'], // RB     grenade
+  [6, 'Mouse2'], // LT     ads
+  [7, 'Mouse0'], // RT     fire
+  [9, 'Escape'], // Start  pause
+  [10, 'ShiftLeft'], // L3     sprint
+  [11, 'KeyV'], // R3     melee
+];
 
 export class Input {
   constructor(canvas, config) {
@@ -50,6 +84,17 @@ export class Input {
 
     this.gamepadIndex = null;
     this.stick = { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
+    this._padActive = false;
+    this._padProbe = 0;
+    /** Which PAD_BUTTONS entries the pad is currently holding down. */
+    this._padHeld = new Uint8Array(PAD_BUTTONS.length);
+
+    /**
+     * On-screen controls. Only built on a device that actually has a touch
+     * screen, and never in a deterministic (capture) session — the pixel gate
+     * must not grow an overlay. See src/core/touch.js.
+     */
+    this.touch = null;
 
     this._bound = {
       keydown: this._onKeyDown.bind(this),
@@ -65,6 +110,14 @@ export class Input {
   }
 
   attach() {
+    if (
+      !this.config?.deterministic &&
+      typeof navigator !== 'undefined' &&
+      navigator.maxTouchPoints > 0
+    ) {
+      this.touch = new TouchControls(this);
+      this.touch.attach();
+    }
     addEventListener('keydown', this._bound.keydown);
     addEventListener('keyup', this._bound.keyup);
     addEventListener('mousedown', this._bound.mousedown);
@@ -86,6 +139,8 @@ export class Input {
     removeEventListener('blur', this._bound.blur);
     document.removeEventListener('pointerlockchange', this._bound.lockchange);
     this.canvas.removeEventListener('contextmenu', this._bound.contextmenu);
+    this.touch?.detach();
+    this.touch = null;
   }
 
   requestPointerLock() {
@@ -114,14 +169,22 @@ export class Input {
     this._pendingUp.add(e.code);
   }
 
+  /**
+   * A touch generates *compatibility* mouse events on top of the pointer
+   * events, so without the `usingTouch` guard every tap anywhere on a phone
+   * would arrive here as button 0 and fire the weapon. TouchControls also calls
+   * preventDefault(), which suppresses them on conforming browsers; this is the
+   * belt to that pair of braces, and it also keeps the pointer-lock request from
+   * being made on a platform that has no Pointer Lock API.
+   */
   _onMouseDown(e) {
-    if (!this.enabled) return;
+    if (!this.enabled || this.touch?.usingTouch) return;
     if (!this.pointerLocked && e.button === 0) this.requestPointerLock();
     this._pendingDown.add(`Mouse${e.button}`);
   }
 
   _onMouseUp(e) {
-    if (!this.enabled) return;
+    if (!this.enabled || this.touch?.usingTouch) return;
     this._pendingUp.add(`Mouse${e.button}`);
   }
 
@@ -147,9 +210,16 @@ export class Input {
     for (const code of this.down) this._pendingUp.add(code);
     this._rawLook.x = 0;
     this._rawLook.y = 0;
+    this._padHeld.fill(0);
+    this.touch?.releaseAll();
   }
 
   beginFrame() {
+    // BEFORE the pending sets are drained, not after: the pad now injects action
+    // codes as well as axes, and polling afterwards would land every button
+    // press one frame late.
+    this._pollGamepad();
+
     this._pressed.clear();
     this._released.clear();
 
@@ -174,25 +244,65 @@ export class Input {
     this.wheel = this._pendingWheel;
     this._pendingWheel = 0;
 
-    this._pollGamepad();
+    // Last word on the move stick: only while a finger is actually on it. With
+    // no finger down `_pollGamepad` has already left the correct value there —
+    // the controller's, or zero.
+    this.touch?.applyStick(this.stick);
   }
 
   endFrame() {}
 
+  /**
+   * `navigator.getGamepads()` allocates a fresh array (and a fresh Gamepad
+   * snapshot per slot) on every call, and the two arrow functions below were
+   * rebuilt with it — every frame, on every machine, whether or not a controller
+   * exists. Once one IS connected we still poll every frame, because a Gamepad
+   * snapshot is not live and stick input must not lag; until then we look every
+   * 30 frames, which is twice as often as a human can plug something in.
+   */
   _pollGamepad() {
-    const pads = navigator.getGamepads?.() ?? [];
+    if (!this._padActive) {
+      this._padProbe = (this._padProbe + 1) % 30;
+      if (this._padProbe !== 0) return;
+    }
+    const pads = navigator.getGamepads?.() ?? EMPTY_PADS;
     const pad = pads[this.gamepadIndex ?? 0] ?? pads.find(Boolean);
     if (!pad) {
+      if (this._padActive) this._releasePadButtons();
+      this._padActive = false;
       this.stick.moveX = this.stick.moveY = this.stick.lookX = this.stick.lookY = 0;
       return;
     }
-    const dz = (v) => (Math.abs(v) < 0.16 ? 0 : (v - Math.sign(v) * 0.16) / 0.84);
-    this.stick.moveX = dz(pad.axes[0] ?? 0);
-    this.stick.moveY = dz(pad.axes[1] ?? 0);
+    this._padActive = true;
+    this.stick.moveX = padDeadzone(pad.axes[0] ?? 0);
+    this.stick.moveY = padDeadzone(pad.axes[1] ?? 0);
     // Cubic response curve on the look stick — fine aim near centre, fast flicks at the edge.
-    const curve = (v) => Math.sign(v) * Math.abs(v) ** 2.4;
-    this.stick.lookX = curve(dz(pad.axes[2] ?? 0));
-    this.stick.lookY = curve(dz(pad.axes[3] ?? 0));
+    this.stick.lookX = padCurve(padDeadzone(pad.axes[2] ?? 0));
+    this.stick.lookY = padCurve(padDeadzone(pad.axes[3] ?? 0));
+
+    // Buttons. `_padHeld` is what makes this composable with the keyboard: we
+    // only ever post a release for a code the PAD pressed, so an unpressed B
+    // button cannot cancel the Ctrl the player is holding on the keyboard.
+    if (!this.enabled) return;
+    const buttons = pad.buttons;
+    if (!buttons) return;
+    for (let i = 0; i < PAD_BUTTONS.length; i++) {
+      const b = buttons[PAD_BUTTONS[i][0]];
+      // Triggers are analog: `pressed` is a full pull on some drivers.
+      const on = b ? b.pressed === true || (b.value ?? 0) > 0.5 : false;
+      if (on === !!this._padHeld[i]) continue;
+      this._padHeld[i] = on ? 1 : 0;
+      (on ? this._pendingDown : this._pendingUp).add(PAD_BUTTONS[i][1]);
+    }
+  }
+
+  /** A pad that vanished mid-hold must not leave the player firing forever. */
+  _releasePadButtons() {
+    for (let i = 0; i < PAD_BUTTONS.length; i++) {
+      if (!this._padHeld[i]) continue;
+      this._padHeld[i] = 0;
+      this._pendingUp.add(PAD_BUTTONS[i][1]);
+    }
   }
 
   /** True while any key bound to `action` is held. */

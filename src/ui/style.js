@@ -84,6 +84,11 @@ const CSS = `
   overflow: hidden;
   contain: layout style;
   user-select: none;
+  /* The HUD covers the viewport. Without this a drag that starts on it is a
+     page scroll / rubber-band on a phone rather than a look input. */
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .ow-hud .lbl {
@@ -136,31 +141,16 @@ const CSS = `
 }
 .ow-dmg svg { width:100%; height:100%; display:block; overflow:visible; }
 
-/* ============================================================ hurt state */
-.ow-blood { position:absolute; inset:-7%; will-change: opacity, transform; }
-.ow-blood-a {
-  position:absolute; inset:0;
-  background:
-    radial-gradient(ellipse 78% 74% at 50% 50%, rgba(0,0,0,0) 62%, rgba(122,14,10,.30) 86%, rgba(74,8,5,.60) 100%);
-  filter: url(#ow-warp);
-}
-.ow-blood-b {
-  position:absolute; inset:0; opacity:.5; mix-blend-mode:multiply;
-  background:
-    radial-gradient(circle at 2% 22%,  rgba(96,10,8,.75) 0, rgba(96,10,8,0) 17%),
-    radial-gradient(circle at 99% 58%, rgba(96,10,8,.7) 0, rgba(96,10,8,0) 15%),
-    radial-gradient(circle at 26% 101%,rgba(88,10,8,.75) 0, rgba(88,10,8,0) 19%),
-    radial-gradient(circle at 74% -2%, rgba(88,10,8,.7) 0, rgba(88,10,8,0) 18%);
-  filter: url(#ow-warp);
-}
-.ow-desat { position:absolute; inset:0; backdrop-filter: saturate(.6) contrast(1.04) brightness(.97); }
-.ow-hitflash { position:absolute; inset:0;
-  background: radial-gradient(ellipse 90% 86% at 50% 50%, rgba(150,16,10,.22) 40%, rgba(160,18,12,.62) 100%);
-  mix-blend-mode:screen; }
-.ow-lowbeat {
-  position:absolute; inset:0;
-  background: radial-gradient(ellipse 76% 70% at 50% 50%, rgba(0,0,0,0) 64%, rgba(150,14,10,.34) 100%);
-}
+/* ============================================================ hurt state
+   NOT HERE ANY MORE, AND DO NOT PUT IT BACK. The blood vignette, the heartbeat
+   ring, the hit flash and the desaturation used to be five stacked full-screen
+   layers using backdrop-filter, mix-blend-mode and an feTurbulence SVG
+   filter. All three of those read the pixels underneath the layer, and what is
+   underneath is a canvas that redraws every frame — so the browser could never
+   cache any of them and had to read back the framebuffer, run a filter graph and
+   recomposite EVERY FRAME for as long as the player was hurt.
+   They live in the render composite now: RenderSystem.setHurt, driven from
+   src/ui/health.js. See the block in src/render/composite.js. */
 
 /* ====================================================== vitals (bottom left)
    The most important number on the screen, so it gets the mirror position to
@@ -184,7 +174,11 @@ const CSS = `
   font-family: var(--fd); font-size: calc(26px * var(--k)); font-weight:700;
   letter-spacing:.02em; line-height:.85; color: var(--ink);
   text-shadow: var(--o2), 0 0 calc(12px * var(--k)) rgba(0,0,0,.5);
-  will-change: color, transform;
+  /* NOT "color": it is not a compositable property, so hinting it bought
+     nothing and only widened the hint list. "transform" still promotes the
+     element, so its rasterisation is unchanged — which matters, see the
+     compass note below. */
+  will-change: transform;
 }
 .ow-vt-num i {
   font-style:normal; font-family: var(--ff); font-size: calc(11px * var(--k));
@@ -273,7 +267,7 @@ const CSS = `
   font-family: var(--fd);
   font-size: calc(56px * var(--k)); font-weight:700; letter-spacing:.02em;
   color: var(--ink); text-shadow: var(--o2), 0 0 calc(16px * var(--k)) rgba(0,0,0,.55);
-  will-change: color, transform;
+  will-change: transform; /* not "color" — see .ow-vt-num */
 }
 .ow-ammo-sep { font-size: calc(20px * var(--k)); color: var(--ink-3); font-weight:400;
   text-shadow: var(--sh-o1); }
@@ -515,7 +509,8 @@ const CSS = `
   position:absolute; left:50%; top:50%; width:calc(30px * var(--k)); height:calc(30px * var(--k));
   margin:calc(-15px * var(--k)) 0 0 calc(-15px * var(--k));
   border: calc(1.5px * var(--k)) solid var(--red); border-radius:50%;
-  will-change: transform, opacity;
+  /* no will-change: .ow-nade above already promotes the whole marker, and a
+     promoted layer inside a promoted layer is a second texture for nothing. */
 }
 .ow-nade-core {
   position:absolute; left:50%; top:50%; width:calc(15px * var(--k)); height:calc(15px * var(--k));
@@ -677,21 +672,43 @@ const CSS = `
   letter-spacing:.2em; color: var(--ink-3);
 }
 
+/* ================================================ portrait interstitial
+   A phone held upright shows a 9:19.5 slice of a game framed for 16:9, and the
+   HUD's four corner anchors collide in the middle of it. Rather than author a
+   second layout, block: rotating is one gesture and it is what the player wants
+   anyway. Built only on a touch device (see ui/index.js) so a narrow desktop
+   window is never interrupted. z-index puts it over the pause menu, which is
+   the one other thing inside .ow-hud that takes input. */
+.ow-rotate {
+  position:absolute; inset:0; z-index:5;
+  display:none; pointer-events:auto;
+  flex-direction:column; align-items:center; justify-content:center;
+  gap: calc(var(--u) * 3.5);
+  background: #05080b; text-align:center; padding: calc(var(--u) * 6);
+}
+.ow-rotate-icon {
+  width: calc(44px * var(--k)); height: calc(72px * var(--k));
+  border: calc(2px * var(--k)) solid var(--ink-2);
+  border-radius: calc(7px * var(--k));
+  transform: rotate(-26deg);
+}
+.ow-rotate-t {
+  font-family: var(--fd); font-size: calc(23px * var(--k));
+  letter-spacing:.28em; font-weight:700; text-shadow: var(--sh-o1);
+}
+.ow-rotate-s {
+  font-size: calc(10px * var(--k)); letter-spacing:.24em; color: var(--ink-3);
+}
+
 /* ============================================================== fadeouts */
 .ow-hidden { display:none !important; }
 `;
 
-const DEFS = `
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <defs>
-    <!-- organic edge for the blood vignette: banded turbulence displacing the
-         gradient so the hurt overlay never reads as a clean radial ramp -->
-    <filter id="ow-warp" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
-      <feTurbulence type="fractalNoise" baseFrequency="0.006 0.011" numOctaves="4" seed="17" result="n"/>
-      <feDisplacementMap in="SourceGraphic" in2="n" scale="34" xChannelSelector="R" yChannelSelector="G"/>
-    </filter>
-  </defs>
-</svg>`;
+/* The `<defs>` block that used to live here held one filter, `#ow-warp`
+   (feTurbulence + feDisplacementMap), which warped the blood vignette's edge.
+   The vignette is drawn by the render composite now and gets its organic edge
+   from two octaves of value noise in the shader, so there is nothing left to
+   define. */
 
 let installed = false;
 
@@ -701,15 +718,10 @@ export function installStyles() {
   s.id = 'ow-ui-style';
   s.textContent = CSS;
   document.head.appendChild(s);
-  const d = document.createElement('div');
-  d.id = 'ow-ui-defs';
-  d.innerHTML = DEFS;
-  document.body.appendChild(d);
   installed = true;
 }
 
 export function removeStyles() {
   document.getElementById('ow-ui-style')?.remove();
-  document.getElementById('ow-ui-defs')?.remove();
   installed = false;
 }
