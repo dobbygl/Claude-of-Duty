@@ -52,9 +52,19 @@ export class MaterialSystem {
     this.ctx = ctx;
     const q = ctx?.config?.q;
     this._anisotropy = q?.anisotropy ?? 8;
-    // Texture budget scales with the quality preset; 1K is the reference.
+    // Texture budget scales with the quality preset; 1K is the reference. The
+    // per-preset values are now a config field (`textureScale`), written at
+    // exactly what the preset-name test below produced, so this is a no-op
+    // rename for low/medium/high/ultra. `mobile` adds a 0.25 tier: 256px maps,
+    // ~12 MB of VRAM for the whole library against 90-140 MB at 1K.
     this._quality =
-      ctx?.config?.quality === 'low' ? 0.5 : ctx?.config?.quality === 'medium' ? 0.75 : 1;
+      q?.textureScale ??
+      (ctx?.config?.quality === 'low' ? 0.5 : ctx?.config?.quality === 'medium' ? 0.75 : 1);
+    /**
+     * Phone tier: strip every layer of the surface shader whose cost is a
+     * DEPENDENT texture fetch. See `_simplify()` for the list and the reasons.
+     */
+    this._simple = q?.simpleMaterials === true;
     this._tryBuild();
   }
 
@@ -189,6 +199,7 @@ export class MaterialSystem {
     delete p.three;
     delete p.bake;
     p.groundY = opts.groundY ?? this._groundY;
+    if (this._simple) this._simplify(p);
 
     const threeProps = { ...(def.three ?? {}), ...(opts.three ?? {}) };
     const usePhysical = threeProps.physical === true;
@@ -222,6 +233,41 @@ export class MaterialSystem {
 
     this._materials.set(matKey, mat);
     return mat;
+  }
+
+  /**
+   * Phone tier. Every one of these is a #define in shader.js, so what is removed
+   * is removed at COMPILE time — the mobile programs are genuinely shorter, not
+   * branched around. Counted per fragment, against the desktop path:
+   *
+   *   parallax    OW_PARALLAX is a march of up to 22 DEPENDENT textureGrad
+   *               fetches plus a refinement step. It is the single most
+   *               expensive thing a wall does. -> 0
+   *   triplanar   OW_TRIPLANAR samples map / roughnessMap / normalMap on three
+   *               axes and blends: 9 fetches where planar takes 3. Only the
+   *               ground surfaces use it. -> planar
+   *   detile      OW_DETILE takes a second full set of 3 fetches at a rotated
+   *               UV to hide repetition. -> off
+   *   macroBig    a second pair of macro fetches for the 8-16 m band. -> off
+   *   macroRelief OW_MACRO_RELIEF takes 2 more macro fetches to build a
+   *               gradient. -> off
+   *   patch       OW_PATCH is a cellular repair-patch layer on vertical faces.
+   *               -> off
+   *
+   * What is deliberately KEPT: the detail normal (one fetch, and it is the
+   * whole "no flat surfaces" rule), the base macro multiply (2 fetches, and it
+   * is what stops a 12 m facade tiling), weathering and the vertex masks (pure
+   * ALU on values already fetched). Losing those would not make the frame
+   * cheaper in any way that matters and would make it look untextured.
+   */
+  _simplify(p) {
+    p.parallax = 0;
+    if (p.uvMode === 'triplanar') p.uvMode = 'planar';
+    p.detile = 0;
+    p.macroBig = [p.macroBig?.[0] ?? 1, 0, p.macroBig?.[2] ?? 0.03, 0];
+    p.macroRelief = 0;
+    p.patch = [0, p.patch?.[1] ?? 2.6, 0, 0];
+    return p;
   }
 
   /** Explicit variant request — same as get(), reads better at the call site. */

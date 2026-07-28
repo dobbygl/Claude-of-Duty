@@ -70,6 +70,29 @@ const LEVEL_TZ = 1.34;
  */
 const LIGHT_SLOTS = 20;
 
+/**
+ * The mobile budget, and the arithmetic behind it.
+ *
+ * Every lit fragment in the frame runs one GGX evaluation per SLOT, whether the
+ * slot holds a lamp or a black ballast light — 24 of them today. Cutting the
+ * slot count is therefore one of the largest single ALU savings available, but
+ * the count has to stay ABOVE the worst case that can actually be lit or the
+ * ratchet in `_stabiliseLightCount` fires and recompiles every material once.
+ *
+ * Worst case at `mobile`, counted:
+ *   world practicals   6 bulbs (13 m) + 3 lamps (22 m) after thinning,
+ *                      of which a sweep of the map can put at most ~5 in range
+ *   fx flash pool      2 (see `fxLights` below) — registered at 90 m, so they
+ *                      are ALWAYS in range and always count
+ *   ------------------------------------------------------------------
+ *   7, so 8 slots, with one spare. 24 -> 8 is a 3x cut in the light loop.
+ */
+const MOBILE = {
+  /** Keep every Nth interior bulb / street lamp. */
+  bulbStride: 2,
+  lampStride: 2,
+};
+
 /** Spawn points in LEVEL space: [x, z, yaw, tag]. */
 const SPAWNS = [
   [0.4, 22.5, Math.PI, 'north street'],
@@ -102,8 +125,16 @@ export class WorldSystem {
     // Weathering in the shared materials keys off the ground plane.
     materials.setGroundLevel?.(0);
 
+    const q = ctx.config?.q ?? {};
     const t0 = performance.now();
-    const A = new Assembler({ materials, rng, render });
+    const A = new Assembler({
+      materials,
+      rng,
+      render,
+      drawDistance: q.drawDistance ?? 0,
+      lodBias: q.lodBias ?? 1,
+      propDensity: q.propDensity ?? 1,
+    });
     this.A = A;
     A.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
 
@@ -169,8 +200,20 @@ export class WorldSystem {
   _addLights(A) {
     this.bulbs = [];
     this.lamps = [];
+    /**
+     * Slot budget. A preset field rather than a constant because it is a shader
+     * permutation key: it may not change while the process is running, and the
+     * only safe moment to pick it is before the first material compiles.
+     */
+    const slots = this.ctx.config?.q?.lightSlots ?? LIGHT_SLOTS;
+    const thin = slots < LIGHT_SLOTS;
+    const bulbStride = thin ? MOBILE.bulbStride : 1;
+    const lampStride = thin ? MOBILE.lampStride : 1;
+    this._lightSlots = slots;
 
+    let bi = 0;
     for (const b of A.interiorLights.slice(0, 20)) {
+      if (bi++ % bulbStride !== 0) continue;
       // A bare 60 W bulb in an unlit room: the only thing separating an interior
       // from a black hole, so it has to actually carry the room.
       // Intensity is re-driven every update() off the solar altitude; this is
@@ -182,7 +225,9 @@ export class WorldSystem {
       this.bulbs.push(l);
     }
 
+    let li = 0;
     for (const p of A.lampAnchors) {
+      if (li++ % lampStride !== 0) continue;
       const l = new THREE.PointLight(0xffb765, 0, 22, 2);
       l.position.set(p.x, p.y - 0.12, p.z);
       l.castShadow = false;
@@ -228,7 +273,8 @@ export class WorldSystem {
    */
   _addBallast() {
     this._ballast = [];
-    for (let i = 0; i < LIGHT_SLOTS + 4; i++) {
+    const slots = this._lightSlots ?? LIGHT_SLOTS;
+    for (let i = 0; i < slots + 4; i++) {
       const l = new THREE.PointLight(0x000000, 0, 0.01, 2);
       l.name = `world_light_ballast_${i}`;
       l.castShadow = false;
@@ -242,7 +288,7 @@ export class WorldSystem {
     /** Point lights in the scene that are NOT ballast; refreshed periodically. */
     this._pointLights = [];
     this._pointLightsFrame = -1e9;
-    this._lightTarget = LIGHT_SLOTS;
+    this._lightTarget = slots;
     this._lightRanges = new Map(); // light -> the cull radius `render` gave it
     this._camPos = new THREE.Vector3();
     this._collectPointLight = (o) => {

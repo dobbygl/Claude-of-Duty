@@ -35,14 +35,30 @@ const _UP = new THREE.Vector3(0, 1, 0);
  * Sized so a 120 m map splits into a handful of buckets: finer chunking culls a
  * little better but multiplies draw calls through the prepass and four shadow
  * cascades, which is the wrong trade at this map size.
+ *
+ * It IS the right trade once a real draw distance exists: a 64 m bucket has a
+ * ~45 m bounding radius, so `updateLod`'s `distance - radius` test can never
+ * reject it inside a 120 m map, and the whole cloud draws from anywhere. See
+ * `_chunkSize`.
  */
 const CHUNK = 64;
+const CHUNK_LOD = 32;
 
 export class Assembler {
-  constructor({ materials, rng, render }) {
+  /**
+   * @param {object} o
+   * @param {number} [o.drawDistance] metres past which a chunked instance cloud
+   *   is not drawn at all. 0 = unlimited (every preset before `mobile`).
+   * @param {number} [o.lodBias]      multiplier on each prototype's own maxDist.
+   * @param {number} [o.propDensity]  fraction of `optional` instances to keep.
+   */
+  constructor({ materials, rng, render, drawDistance = 0, lodBias = 1, propDensity = 1 }) {
     this.materials = materials;
     this.rng = rng;
     this.render = render;
+    this.drawDistance = drawDistance > 0 ? drawDistance : 0;
+    this.lodBias = lodBias > 0 ? lodBias : 1;
+    this.propDensity = Math.min(1, Math.max(0, propDensity));
     this._mats = new Map(); // palette key -> THREE.Material
     this._static = new Map(); // palette key -> Accum
     this._protos = new Map(); // id -> { geo, key, instances[], masks[], opts }
@@ -203,6 +219,16 @@ export class Assembler {
       receiveShadow: spec.receiveShadow !== false,
       chunk: spec.chunk !== false,
       maxDist: spec.maxDist ?? 0,
+      /**
+       * OPTIONAL means "pure scatter": nothing references this instance, it
+       * carries no collision proxy of its own, and removing some fraction of the
+       * cloud changes the density of litter on the floor and nothing else. It is
+       * the only thing `propDensity` is allowed to touch — thinning a crate
+       * would leave its collision box standing in an empty street.
+       */
+      optional: !!spec.optional,
+      /** Fractional accumulator for the density stride; see place(). */
+      keep: 0,
       matrices: [],
       masks: [],
       noPrepass: !!spec.noPrepass,
@@ -220,6 +246,19 @@ export class Assembler {
     if (!p) {
       console.warn(`[world] no prop prototype "${id}"`);
       return this;
+    }
+    /**
+     * Density thinning, for `optional` prototypes only. A fractional stride
+     * rather than a random draw on purpose: it consumes NO rng, so the level
+     * every other preset builds — every jitter, every seed, every downstream
+     * draw — is bit-identical whatever the density is. The kept instances are
+     * evenly spread through the placement order, which for a scatter pass is
+     * spatially even too.
+     */
+    if (p.optional && this.propDensity < 1) {
+      p.keep += this.propDensity;
+      if (p.keep < 1) return this;
+      p.keep -= 1;
     }
     p.matrices.push(this._x(matrix).clone());
     p.masks.push(masks ? [masks[0], masks[1], masks[2]] : null);
@@ -342,11 +381,12 @@ export class Assembler {
         continue;
       }
       const buckets = new Map();
+      const chunkSize = this.drawDistance > 0 ? CHUNK_LOD : CHUNK;
       if (p.chunk && n > 24) {
         for (let i = 0; i < n; i++) {
           const m = p.matrices[i];
-          const gx = Math.floor(m.elements[12] / CHUNK);
-          const gz = Math.floor(m.elements[14] / CHUNK);
+          const gx = Math.floor(m.elements[12] / chunkSize);
+          const gz = Math.floor(m.elements[14] / chunkSize);
           const k = gx * 97 + gz;
           let b = buckets.get(k);
           if (!b) buckets.set(k, (b = []));
@@ -388,8 +428,19 @@ export class Assembler {
         this.stats.instances += list.length;
         const tri = (p.geo.index ? p.geo.index.count : p.geo.getAttribute('position').count) / 3;
         this.stats.instTris += tri * list.length;
-        if (p.maxDist > 0) {
-          im.userData.owLodDist = p.maxDist;
+        /**
+         * Two independent caps, whichever is nearer:
+         *   - the prototype's own `maxDist` (a bottle is pointless at 60 m),
+         *     scaled by the preset's lodBias;
+         *   - the preset's global `drawDistance`, which only applies to CHUNKED
+         *     clouds. A `chunk:false` prototype is a landmark — the lamp posts,
+         *     the palms, the burnt-out car — and one of those popping out at
+         *     the end of the street is the one artefact nobody would accept.
+         */
+        let lod = p.maxDist > 0 ? p.maxDist * this.lodBias : Infinity;
+        if (this.drawDistance > 0 && p.chunk) lod = Math.min(lod, this.drawDistance);
+        if (Number.isFinite(lod)) {
+          im.userData.owLodDist = lod;
           this.lodGroups.push(im);
         }
       }

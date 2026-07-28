@@ -196,7 +196,9 @@ export function registerDressingProps(A, rng) {
       for (const p of list) p.dispose();
       return g;
     })(),
-    { maxDist: 40, castShadow: false }
+    // `optional`: ground scatter with no collision, safe for propDensity to
+    // thin on the phone tier. See Assembler.place().
+    { maxDist: 40, castShadow: false, optional: true }
   );
 
   // Cinder blocks — the universal Middle-Eastern building unit.

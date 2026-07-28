@@ -29,7 +29,7 @@ const MAX_EMITTERS = 40;
 const REF = 2.0;
 
 class Emitter {
-  constructor(actx, mixer) {
+  constructor(actx, mixer, hrtf = true) {
     this.actx = actx;
     this.mixer = mixer;
     this.input = gain(actx, 1);
@@ -40,7 +40,15 @@ class Emitter {
     this.sendGain = gain(actx, 0);
 
     const p = actx.createPanner();
-    p.panningModel = 'HRTF';
+    /**
+     * HRTF is a per-sample convolution against a measured head-related impulse
+     * response, per emitter, and it is by a wide margin the most expensive node
+     * in the audio graph — 40 of them is not a phone budget. `equalpower` is a
+     * pair of gains: it keeps left/right placement and loses elevation and the
+     * front/back cue, both of which are already carried here by the occlusion
+     * filter and the distance model.
+     */
+    p.panningModel = hrtf ? 'HRTF' : 'equalpower';
     p.distanceModel = 'inverse';
     p.refDistance = 1;
     p.rolloffFactor = 0; // attenuation handled by distGain
@@ -143,7 +151,8 @@ export class SpatialField {
     this.mixer = mixer;
     this.ctx = ctx;
     this.emitters = [];
-    for (let i = 0; i < MAX_EMITTERS; i++) this.emitters.push(new Emitter(actx, mixer));
+    const hrtf = ctx?.config?.q?.hrtf !== false;
+    for (let i = 0; i < MAX_EMITTERS; i++) this.emitters.push(new Emitter(actx, mixer, hrtf));
 
     // Preallocated scratch — update() must never allocate.
     this._lp = { x: 0, y: 1.6, z: 0 };
@@ -152,6 +161,21 @@ export class SpatialField {
     this._trackCursor = 0;
     this.stats = { active: 0, stolen: 0, dropped: 0, occlusionRays: 0 };
     this.occlusionEnabled = true;
+  }
+
+  /**
+   * Swap every emitter's panning model. `panningModel` is settable on a live
+   * PannerNode — the node keeps its connections and its automation, only the
+   * spatialisation algorithm changes — so this is the one quality field the
+   * audio graph can honour at runtime without rebuilding anything.
+   *
+   * @returns {boolean} true if anything changed.
+   */
+  setHrtf(on) {
+    const model = on ? 'HRTF' : 'equalpower';
+    if (this.emitters.length && this.emitters[0].panner.panningModel === model) return false;
+    for (let i = 0; i < this.emitters.length; i++) this.emitters[i].panner.panningModel = model;
+    return true;
   }
 
   /** Feed the AudioListener from the render camera. Called once per frame. */

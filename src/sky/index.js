@@ -286,11 +286,11 @@ export class SkySystem {
     };
 
     // ---- LUTs -------------------------------------------------------------
-    this.luts = new SkyLuts(this.renderer, this.shared);
+    this.luts = new SkyLuts(this.renderer, this.shared, { quality: q.skyQuality ?? 1 });
     this.luts.bakeStatic();
 
     // ---- visible sky ------------------------------------------------------
-    this.dome = new SkyDome(this.shared);
+    this.dome = new SkyDome(this.shared, { quality: q.skyQuality ?? 1 });
     ctx.scene.add(this.dome.mesh);
     // We paint the sky ourselves; drop the renderer's fallback background so it
     // is not drawn underneath us every frame for nothing.
@@ -327,13 +327,23 @@ export class SkySystem {
     this.envMap = null;
 
     // ---- volumetrics ------------------------------------------------------
-    const steps = q.volumetrics ? (ctx.config.quality === 'ultra' ? 56 : q.ssr ? 44 : 28) : 0;
-    this.volumetrics = new Volumetrics(this.shared, r, {
-      volumetrics: q.volumetrics,
-      steps: Math.max(8, steps),
-      scale: 0.5,
-    });
-    this._unregisterPass = r.registerPass(this.volumetrics);
+    this.volumetrics = null;
+    this._unregisterPass = null;
+    this._buildVolumetrics();
+    // A runtime preset change (`ui:quality`, wired in FASE 5) has to reach this
+    // pass: `marchEnabled` is decided at construction and, worse, the COMPOSITE
+    // half compiles with `VOL_ANALYTIC` when the march is off, so flipping a
+    // boolean at runtime would leave the analytic-fog shader sampling a march
+    // buffer that no longer exists. Rebuilding is 3 full-screen programs; there
+    // is no cheaper correct option, and it is still four orders of magnitude off
+    // the lit-material recompile that changing the cascade COUNT would cost —
+    // which is exactly why `render` freezes the cascade count and this pass can
+    // keep spreading `csm.uniforms` and its `OW_CASCADES` define by reference.
+    this._onQuality = () => {
+      if (!!this.ctx.config.q.volumetrics === this.volumetrics.marchEnabled) return;
+      this._buildVolumetrics();
+    };
+    ctx.events.on('ui:quality', this._onQuality);
 
     // ---- bookkeeping ------------------------------------------------------
     this.ambientColor = new THREE.Color(0, 0, 0);
@@ -853,7 +863,28 @@ export class SkySystem {
     this.ctx.events.emit('sky:env', { envMap: this.envMap, sunDir: this.celestial.sun });
   }
 
+  /**
+   * (Re)build the volumetric pass for the CURRENT preset and re-register it.
+   * Safe to call on a live renderer: the old pass is unregistered before it is
+   * disposed, so the frame loop can never walk a disposed material.
+   */
+  _buildVolumetrics() {
+    const ctx = this.ctx;
+    const q = ctx.config.q;
+    const r = this.render;
+    this._unregisterPass?.();
+    this.volumetrics?.dispose();
+    const steps = q.volumetrics ? (ctx.config.quality === 'ultra' ? 56 : q.ssr ? 44 : 28) : 0;
+    this.volumetrics = new Volumetrics(this.shared, r, {
+      volumetrics: q.volumetrics,
+      steps: Math.max(8, steps),
+      scale: 0.5,
+    });
+    this._unregisterPass = r.registerPass(this.volumetrics);
+  }
+
   dispose() {
+    if (this._onQuality) this.ctx.events.off('ui:quality', this._onQuality);
     this._unregisterPass?.();
     this.volumetrics.dispose();
     this.ctx.scene.remove(this.dome.mesh);

@@ -49,9 +49,19 @@ export class FxSystem {
     const q = ctx.config.q;
     const budget = q.particleBudget ?? 6000;
     const big = budget >= 10000;
+    /**
+     * The phone tier, derived from the budget rather than from a preset name so
+     * a future adaptive scaler gets it for free. Everything it gates is a
+     * VISIBLE change (fewer particles per impact, unlit smoke, single-sided
+     * quads), so it must not engage at `low` — 2000 is comfortably above it.
+     */
+    const tiny = budget <= 1000;
+    this.tiny = tiny;
 
     const t0 = performance.now();
-    const atlasSize = big ? 1024 : 512;
+    // 256, not 512: the atlas is 16 sprites in a 4x4 grid, so 256 gives each one
+    // 64px — still above the size a puff of smoke covers on a phone screen.
+    const atlasSize = big ? 1024 : tiny ? 256 : 512;
     const particleAtlas = buildParticleAtlas(this.rng.fork(), atlasSize);
     const decalAtlas = buildDecalAtlas(this.rng.fork(), atlasSize);
     this._atlas = particleAtlas;
@@ -66,8 +76,13 @@ export class FxSystem {
     const litCap = Math.round(rest * 0.55);
     const addCap = rest - litCap;
 
-    /** Particles spawned per impact scale with the budget. */
-    this.pScale = clamp(budget / 12000, 0.4, 1.25);
+    /**
+     * Particles spawned per impact scale with the budget. The 0.4 floor exists
+     * so `low` still reads as an impact rather than as three sparks; a phone
+     * cannot afford it — every particle is an overlapping alpha-blended quad,
+     * i.e. pure fill rate, which is exactly what a tiler is short of.
+     */
+    this.pScale = clamp(budget / 12000, tiny ? 0.15 : 0.4, 1.25);
 
     const mk = (capacity, modeName, renderOrder) =>
       new ParticleLayer({
@@ -76,6 +91,7 @@ export class FxSystem {
         atlas: particleAtlas.texture,
         cols: particleAtlas.cols,
         renderOrder,
+        lowp: tiny,
       });
 
     this.lit = mk(litCap, 'lit', 10);
@@ -110,7 +126,13 @@ export class FxSystem {
     });
     this._hazeOff = this.render?.registerPass?.(this.hazeSys.pass) ?? null;
 
-    this.lights = new LightPool(ctx.scene, 4);
+    /**
+     * Flash lights are registered at 90 m, i.e. they are ALWAYS inside the
+     * distance fade, so every one of them is a permanent slot in the world's
+     * light budget (see src/world/index.js). Halving the pool on the phone tier
+     * is what makes an 8-slot budget arithmetically possible.
+     */
+    this.lights = new LightPool(ctx.scene, tiny ? 2 : 4);
     if (this.render?.addLight) this.lights.register(this.render);
     /** Mirrored pool inside viewScene; built with the view layers on first use. */
     this.viewLights = null;

@@ -194,9 +194,16 @@ void main() {
 #ifdef LIT
   float rr = dot( vQ, vQ );
   vec3 nrm = vec3( vQ, sqrt( max( 0.03, 1.0 - rr ) ) );
+#ifndef CHEAP
   // Bend the fake sphere normal by the sprite's own density gradient: this is
   // what turns a soft blob into something with legible internal form.
+  //
+  // Two extra texture fetches' worth of work per fragment (a derivative forces
+  // the quad to be shaded together) on the single most overdrawn surface in the
+  // frame. CHEAP keeps the hemisphere normal and the whole irradiance term — so
+  // smoke stays at the right exposure — and loses only the internal form.
   nrm = normalize( nrm - vec3( dFdx( tex.r ), dFdy( tex.r ), 0.0 ) * 7.0 );
+#endif
   float ndl = dot( nrm, uSunDir );
   float wrap = max( 0.0, ( ndl + 0.42 ) / 1.42 );
   float back = max( 0.0, -ndl );
@@ -255,6 +262,9 @@ export class ParticleLayer {
    * @param {THREE.Texture} o.atlas
    * @param {number} o.cols         atlas columns
    * @param {boolean} [o.soft]      depth-fade against the scene
+   * @param {boolean} [o.lowp]      phone tier: mediump colour math, no
+   *                                derivative-based normal bend. Everything it
+   *                                touches is colour, never a world position.
    */
   constructor(o) {
     this.capacity = Math.max(16, o.capacity | 0);
@@ -309,13 +319,16 @@ export class ParticleLayer {
     if (additive) defines.ADDITIVE = '';
     else defines.LIT = '';
     if (o.soft === false) delete defines.SOFT;
+    if (o.lowp) defines.CHEAP = '';
 
     const mat = new THREE.ShaderMaterial({
       name: `fx-particles-${o.mode}`,
       glslVersion: THREE.GLSL3,
       uniforms: this.uniforms,
       vertexShader: PARTICLE_VERT,
-      fragmentShader: PARTICLE_FRAG,
+      fragmentShader: o.lowp
+        ? PARTICLE_FRAG.replace('precision highp float;', 'precision mediump float;')
+        : PARTICLE_FRAG,
       transparent: true,
       depthTest: true,
       depthWrite: false,

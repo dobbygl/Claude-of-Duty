@@ -912,6 +912,15 @@ export function registerProps(A, rngIn) {
    * on a table — deliberately do not get one.
    */
   const LOOSE = (tilt, sink) => ({ tilt, sink });
+  /**
+   * OPTIONAL: pure ground scatter. Nothing in the level references these by
+   * index, none of them has a collision proxy authored at its placement site,
+   * and none of them is large enough that its absence is a hole rather than a
+   * change of density. They are the only prototypes `config.q.propDensity` is
+   * allowed to thin — see `Assembler.place()`. A crate, a barrel, a cinder
+   * block in a stack, a lamp post or a palm is deliberately NOT in this set.
+   */
+  const SCATTER = { optional: true };
 
   // containers
   P('crate_a', 'wood_prop', crate(rng, 0.64), { skirt: 0.37, ...LOOSE(0.09, 0.022) });
@@ -956,30 +965,30 @@ export function registerProps(A, rngIn) {
   P('lamp_glass', 'lamp_lens', lampGlass(), { chunk: false, castShadow: false });
 
   // debris
-  P('brick_a', 'brick', brickChunk(rng), LOOSE(0.16, 0.006));
-  P('brick_b', 'brick', brickChunk(rng), LOOSE(0.16, 0.006));
-  P('rock_a', 'concrete_prop', rockGeometry(rng, 0.26, 0, 0.7), { maxDist: 90 });
-  P('rock_b', 'concrete_dark', rockGeometry(rng, 0.17, 0, 0.8), { maxDist: 70, castShadow: false });
-  P('slab_shard', 'concrete_prop', slabShard(rng), LOOSE(0.14, 0.01));
-  P('rebar', 'metal_rust', rebarBundle(rng), LOOSE(0.10, 0.004));
-  P('plank_a', 'wood_prop', plank(rng), { maxDist: 90, ...LOOSE(0.06, 0.004) });
-  P('plank_b', 'wood_prop_dark', plank(rng), { maxDist: 90, ...LOOSE(0.06, 0.004) });
-  P('litter', 'wood_pale', litterPaper(rng), { maxDist: 45, castShadow: false });
+  P('brick_a', 'brick', brickChunk(rng), { ...LOOSE(0.16, 0.006), ...SCATTER });
+  P('brick_b', 'brick', brickChunk(rng), { ...LOOSE(0.16, 0.006), ...SCATTER });
+  P('rock_a', 'concrete_prop', rockGeometry(rng, 0.26, 0, 0.7), { maxDist: 90, ...SCATTER });
+  P('rock_b', 'concrete_dark', rockGeometry(rng, 0.17, 0, 0.8), { maxDist: 70, castShadow: false, ...SCATTER });
+  P('slab_shard', 'concrete_prop', slabShard(rng), { ...LOOSE(0.14, 0.01), ...SCATTER });
+  P('rebar', 'metal_rust', rebarBundle(rng), { ...LOOSE(0.10, 0.004), ...SCATTER });
+  P('plank_a', 'wood_prop', plank(rng), { maxDist: 90, ...LOOSE(0.06, 0.004), ...SCATTER });
+  P('plank_b', 'wood_prop_dark', plank(rng), { maxDist: 90, ...LOOSE(0.06, 0.004), ...SCATTER });
+  P('litter', 'wood_pale', litterPaper(rng), { maxDist: 45, castShadow: false, ...SCATTER });
   /**
    * Contact fillets. Registered last so `put()` can find it, and never given a
    * skirt of its own. maxDist keeps them off the far half of the map, where
    * the contact line is a pixel wide anyway.
    */
   P('dust_skirt', 'dust_skirt', dustSkirt(rng), { maxDist: 42, castShadow: false });
-  P('bottle', 'glass', bottle(rng), { maxDist: 55, castShadow: false });
-  P('can', 'steel', can(rng), { maxDist: 45, castShadow: false });
+  P('bottle', 'glass', bottle(rng), { maxDist: 55, castShadow: false, ...SCATTER });
+  P('can', 'steel', can(rng), { maxDist: 45, castShadow: false, ...SCATTER });
 
   // vegetation
   const palm = palmTree(rng, 5.4);
   P('palm_trunk', 'wood_dark', palm, { skirt: 0.57, chunk: false });
   P('palm_frond', 'foliage', palmFrond(rng, 2.7), { chunk: false, receiveShadow: true });
   P('shrub', 'foliage', shrub(rng, 0.85));
-  P('weeds', 'foliage', weedTuft(rng), { maxDist: 40 });
+  P('weeds', 'foliage', weedTuft(rng), { maxDist: 40, ...SCATTER });
   P('planter', 'concrete_prop', planter(rng), { skirt: 0.33, ...LOOSE(0.07, 0.014) });
 
   // signage
@@ -989,6 +998,6 @@ export function registerProps(A, rngIn) {
   // damage
   // 3.2 cm base radius: the callers scale it 0.5-1.5x, so pocks land at 3-10 cm
   // across. At the old 5.5 cm base a single rifle strike was 16 cm wide.
-  P('pock', 'concrete_dark', pockGeometry(rng, 0.032), { maxDist: 65, castShadow: false });
+  P('pock', 'concrete_dark', pockGeometry(rng, 0.032), { maxDist: 65, castShadow: false, ...SCATTER });
   return A;
 }
