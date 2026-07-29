@@ -10,6 +10,7 @@ perf-cand2/
 shots/
 
 # Agent scratch
+.codegraph/
 demo/
 .tmp-demo/
 .tmp-rend/
