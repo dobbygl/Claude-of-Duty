@@ -175,6 +175,30 @@ export async function prewarm(engine, { onProgress = () => {}, transients = fals
     const totalSteps = WARM_POSES.length * 2 + (transients ? transientStages.length : 0) + 1;
     const tick = () => onProgress(Math.min(1, ++step / totalSteps));
 
+    // NOT DONE HERE, and measured rather than assumed: settling the visible
+    // point-light set before this point.
+    //
+    // The theory was sound — the number of visible lights is part of three's
+    // program cache key, `render._cullLights` first runs inside frame 1, and
+    // `world._stabiliseLightCount` only PREDICTS the cull to size its ballast
+    // pool without applying it, so prewarm compiles against a light set that
+    // includes every out-of-range practical. Implemented as a visibility-only
+    // `render.settleLightVisibility(camPos)` (no intensity, no `e.applied`, so
+    // the dusk lamp ramp could not adopt early) and measured twice per side at
+    // `mobile` on this machine:
+    //
+    //   without it   179 programs after boot, 7 lights visible
+    //   with it      182 programs after boot, 8 lights visible
+    //
+    // It costs three programs instead of saving any. Only ~24 programs compile
+    // after prewarm at all, not the whole lit set, and settling recovers two of
+    // them while adding five to prewarm's own total. Worse, `_lightTarget`
+    // RATCHETS (`if (n > this._lightTarget)`), so changing what `n` is on its
+    // first call latches a different ballast budget and the steady state moves
+    // from 7 lit to 8 — a permutation change, not a saving. The real boot cost
+    // is 114 serial compiles on a device with no KHR_parallel_shader_compile;
+    // that is a "compile fewer programs" problem, not a cache-key one.
+
     // Pass 1: compile the static world from each pose, with the depth/shadow
     // variants reached by drawing a real frame at that pose.
     for (const p of WARM_POSES) {

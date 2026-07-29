@@ -53,6 +53,8 @@ export class Engine {
       /** Interpolation alpha between the last two physics steps, 0..1. */ alpha: 0,
       scale: 1,
       frame: 0,
+      /** Wall-clock ms the LAST `step()` spent in JS. See the note in `step`. */
+      stepMs: 0,
     };
 
     this.ctx = {
@@ -174,6 +176,11 @@ export class Engine {
     t.elapsed += t.dt;
     t.frame++;
 
+    // Always measured, profiler or not: the dynamic-resolution controller needs
+    // to know how much of the frame was JS before it decides that a smaller
+    // render target would help. Two `now()` calls a frame, no allocation.
+    const cpu0 = performance.now();
+
     // Profiling is entirely opt-in; `prof` is null in every capture session.
     // `_p0` is a scalar field rather than a local so the marker helper below
     // needs no closure and no allocation.
@@ -266,6 +273,10 @@ export class Engine {
 
       this.input.endFrame();
     }
+
+    // Read by `render._updateDynRes` on the FOLLOWING frame — this is closed
+    // after the render call it would otherwise have to predict.
+    t.stepMs = performance.now() - cpu0;
   }
 
   dispose() {

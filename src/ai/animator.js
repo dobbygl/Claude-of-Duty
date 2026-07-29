@@ -387,6 +387,35 @@ export class Animator {
     b.updateMatrixWorld(true);
   }
 
+  /**
+   * `_applyWorld` without the recursive descendant refresh.
+   *
+   * `_applyWorld` ends in `updateMatrixWorld(true)`, which walks the bone's whole
+   * subtree. Down a parent-to-child chain that is quadratic and all but the last
+   * walk is thrown away: the only reader of a descendant is whatever runs AFTER
+   * the chain is finished. What the NEXT link genuinely needs is its parent's
+   * `matrixWorld`, because `worldQuatOf` reads that matrix rather than composing
+   * quaternions up the tree — so composing this bone alone is sufficient, and
+   * the caller pays for one deep refresh at the end instead of one per link.
+   *
+   * The compose is three's own, verbatim (Object3D.updateMatrixWorld), so the
+   * matrices are bit-identical to what the per-link walk produced.
+   */
+  _applyWorldLocal(i, dq) {
+    const b = this.bones[i];
+    const parent = b.parent;
+    const q = this._qa;
+    if (parent) worldQuatOf(parent, q);
+    else q.identity();
+    const cur = this._qb.copy(q).multiply(b.quaternion);
+    cur.premultiply(dq);
+    b.quaternion.copy(q.invert()).multiply(cur);
+    b.updateMatrix();
+    if (parent) b.matrixWorld.multiplyMatrices(parent.matrixWorld, b.matrix);
+    else b.matrixWorld.copy(b.matrix);
+    b.matrixWorldNeedsUpdate = false;
+  }
+
   /** Point bone `i`'s +Y axis along `dir` (world, unit), preserving twist. */
   _aimBone(i, dir) {
     const b = this.bones[i];
@@ -420,8 +449,15 @@ export class Animator {
       axis.normalize();
       for (let k = 0; k < chain.length; k++) {
         this._q3.setFromAxisAngle(axis, ang * weights[k]);
-        this._applyWorld(chain[k], this._q3);
+        this._applyWorldLocal(chain[k], this._q3);
       }
+      // The chain is Spine -> Spine1 -> Spine2 and every link above composed its
+      // own world matrix, so the only stale matrices left are the DESCENDANTS of
+      // the last link — which the next iteration reads immediately (`iHandR`),
+      // and so do `_lookAt` and `_supportHandIk` after this returns. One walk
+      // from the top of the chain refreshes all of them, replacing the six this
+      // loop used to do.
+      this.bones[chain[0]].updateMatrixWorld(true);
     }
   }
 

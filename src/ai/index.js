@@ -59,7 +59,7 @@ export class AiSystem {
 
     const t0 = performance.now();
     this.materials = new SoldierMaterials(this.rng.fork(), {
-      size: 512,
+      size: ctx.config.q.aiTextureSize ?? 512,
       anisotropy: ctx.config.q.anisotropy ?? 8,
       camo: ['arid', 'woodland', 'urban'],
     });
@@ -121,6 +121,7 @@ export class AiSystem {
     this._mvp = new THREE.Matrix4();
     this._sphere = new THREE.Sphere();
     this._sweep = new THREE.Sphere();
+    this._lodCamPos = new THREE.Vector3();
     this._sun = new THREE.Vector3(0, 1, 0);
     this._lodStats = { irrelevant: 0 };
 
@@ -502,7 +503,7 @@ export class AiSystem {
 
     const variants = ['vanguard', 'irregular', 'breacher'];
     const squads = opts.squads ?? 2;
-    const per = opts.perSquad ?? 3;
+    const per = opts.perSquad ?? this.ctx.config.q.aiPerSquad ?? 3;
     let made = 0;
     for (let q = 0; q < squads && q < ranked.length; q++) {
       const squad = this.createSquad();
@@ -837,6 +838,12 @@ export class AiSystem {
     const cam = ctx.camera;
     this._mvp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     this._frustum.setFromProjectionMatrix(this._mvp);
+    // Distance LOD. `Infinity` on every preset but `mobile`, so both tests below
+    // resolve to exactly today's behaviour there — the comparisons are written
+    // so that the Infinity case is the no-op one.
+    const camPos = cam.getWorldPosition(this._lodCamPos);
+    const animDist = ctx.config?.q?.aiAnimDistance ?? Infinity;
+    const footDist = ctx.config?.q?.aiFootIkDistance ?? Infinity;
     const sun = this._sunDirection();
     // how far a shadow ray can travel before it is under the level
     const floorY = (this.grid ? -6 : -20);
@@ -864,6 +871,12 @@ export class AiSystem {
       a.lodIrrelevant = !visible;
       if (!visible) irrelevant++;
       a.mesh.userData.owNoShadow = !visible;
+
+      const dCam = s.center.distanceTo(camPos);
+      a.lodDistant = visible && dCam > animDist;
+      // The animator owns the flag; nothing else writes it, so driving it from
+      // here per frame cannot fight another owner.
+      if (a.animator) a.animator.footIk = dCam <= footDist;
     }
     this._lodStats.irrelevant = irrelevant;
     this.stats.lodIrrelevant = irrelevant;

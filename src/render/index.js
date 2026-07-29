@@ -1245,6 +1245,8 @@ export class RenderSystem {
       index: ladder.length - 1,
       /** EMA of the UNSCALED frame time, ms. */
       ema: 1000 / 60,
+      /** EMA of the JS half of that frame time, on the same time constant. */
+      cpuEma: 0,
       /** ~20-frame time constant. */
       alpha: 0.05,
       /** Frames of agreement required before any step. */
@@ -1284,12 +1286,22 @@ export class RenderSystem {
     // whenever the harness pumps without advancing the clock.
     if (dt <= 0) return;
     d.ema += (dt * 1000 - d.ema) * d.alpha;
+    d.cpuEma += ((ctx.time.stepMs || 0) - d.cpuEma) * d.alpha;
     if (d.hold < d.holdFrames) {
       d.hold++;
       return;
     }
     let i = d.index;
-    if (d.ema > d.downMs) i--;
+    // `renderScale` sizes the HDR chain and NOTHING else: it cannot remove a
+    // draw call, a physics step or an IK solve. So when JS alone already spends
+    // more than the down threshold, even a GPU that finished instantly would
+    // miss the target, and every step down is image quality traded for nothing.
+    // Measured on a Mali-G78 at the `mobile` preset: 25.8 ms of JS in a 36.5 ms
+    // frame, the ladder walked to its 0.5 floor, and the EMA stayed at 39.4 ms.
+    // Deliberately blocks only the DOWN direction — the up test needs a frame
+    // that is already fast, which a CPU-bound one never is.
+    const cpuBound = d.cpuEma >= d.downMs;
+    if (d.ema > d.downMs && !cpuBound) i--;
     else if (d.ema < d.upMs) i++;
     if (i === d.index || i < 0 || i >= d.ladder.length) return;
     d.index = i;

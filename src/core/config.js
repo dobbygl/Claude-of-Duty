@@ -66,6 +66,19 @@ export const UNITS = {
  *                  and not in anything adaptive.
  *   skyQuality     1 = full screen dome, 0 = reduced octave counts.
  *   hrtf           false swaps every 3D panner to `equalpower`.
+ *   aiTextureSize  edge of the soldier material bake. `SoldierMaterials` had 512
+ *                  hardcoded and read `anisotropy` from the preset on the very
+ *                  next line, so this was an omission, not a policy.
+ *   aiPerSquad     soldiers per squad in the garrison. Never reached by a
+ *                  capture: `populate()` is skipped under `deterministic` and
+ *                  `debugStage('firefight')` places a fixed layout.
+ *   aiAnimDistance  metres past which a VISIBLE actor evaluates its pose every
+ *                  other frame instead of every frame. `Infinity` is what every
+ *                  actor did before this existed. The existing off-screen LOD
+ *                  (one frame in three) still wins where both apply.
+ *   aiFootIkDistance  metres past which foot IK is skipped: two BVH ground rays,
+ *                  two two-bone solves and the sole roll, per actor per frame.
+ *                  At 12 m a boot is about 8 px tall on a phone.
  */
 export const QUALITY_PRESETS = {
   /**
@@ -100,6 +113,10 @@ export const QUALITY_PRESETS = {
     lightSlots: 8,
     skyQuality: 0,
     hrtf: false,
+    aiTextureSize: 128,
+    aiPerSquad: 2,
+    aiAnimDistance: 14,
+    aiFootIkDistance: 12,
   },
   low: {
     renderScale: 0.72,
@@ -127,6 +144,10 @@ export const QUALITY_PRESETS = {
     lightSlots: 20,
     skyQuality: 1,
     hrtf: true,
+    aiTextureSize: 512,
+    aiPerSquad: 3,
+    aiAnimDistance: Infinity,
+    aiFootIkDistance: Infinity,
   },
   medium: {
     renderScale: 0.85,
@@ -154,6 +175,10 @@ export const QUALITY_PRESETS = {
     lightSlots: 20,
     skyQuality: 1,
     hrtf: true,
+    aiTextureSize: 512,
+    aiPerSquad: 3,
+    aiAnimDistance: Infinity,
+    aiFootIkDistance: Infinity,
   },
   high: {
     renderScale: 1.0,
@@ -181,6 +206,10 @@ export const QUALITY_PRESETS = {
     lightSlots: 20,
     skyQuality: 1,
     hrtf: true,
+    aiTextureSize: 512,
+    aiPerSquad: 3,
+    aiAnimDistance: Infinity,
+    aiFootIkDistance: Infinity,
   },
   ultra: {
     renderScale: 1.0,
@@ -208,6 +237,10 @@ export const QUALITY_PRESETS = {
     lightSlots: 20,
     skyQuality: 1,
     hrtf: true,
+    aiTextureSize: 512,
+    aiPerSquad: 3,
+    aiAnimDistance: Infinity,
+    aiFootIkDistance: Infinity,
   },
 };
 

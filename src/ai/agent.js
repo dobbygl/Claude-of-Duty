@@ -245,6 +245,8 @@ export class Agent {
     /* ---------------- LOD ---------------- */
     /** set by AiSystem._updateRelevance: nothing this actor does reaches a pixel */
     this.lodIrrelevant = false;
+    /** On screen, but far enough that a half-rate pose is indistinguishable. */
+    this.lodDistant = false;
     this._animSkip = 0;
     this._animAccum = 0;
     /**
@@ -1015,6 +1017,16 @@ export class Agent {
         return;
       }
       this._animSkip = 2; // one evaluation in three while nothing can see it
+    } else if (this.lodDistant) {
+      // Visible, but past `aiAnimDistance`. Same accumulator, so the stride
+      // phase and the reload timeline stay on one clock and the actor does not
+      // skate when it crosses back. `Infinity` on every preset but `mobile`,
+      // which makes this branch unreachable there — see core/config.js.
+      if (this._animSkip > 0) {
+        this._animSkip--;
+        return;
+      }
+      this._animSkip = 1; // one evaluation in two
     } else {
       this._animSkip = 0;
     }
