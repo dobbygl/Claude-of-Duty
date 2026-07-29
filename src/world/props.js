@@ -56,6 +56,62 @@ export function autoEdgeWear(geo, margin = 0.02, amount = 1) {
   });
 }
 
+/**
+ * Geometry detail tier for everything this module builds, 1 = full.
+ * Set once by `registerProps()` from `Assembler.geoDetail`, which comes from
+ * `config.q.geoDetail`. Module-level rather than threaded through forty
+ * generators because it is fixed for the whole build and read in `PB.box`,
+ * which is called thousands of times.
+ */
+let DETAIL = 1;
+
+/**
+ * Longest dimension, in metres, at which a box counts as a "thin member" and
+ * gives up its chamfer at reduced detail. 6 cm catches the 1.6 cm crate slats,
+ * the 2 cm lid boards and the 5 cm corner posts, and leaves the crate BODY —
+ * the thing that owns the silhouette and the lit edge — chamfered.
+ */
+const THIN = 0.06;
+
+/**
+ * A 12-triangle box standing in for a chamfer box on a thin member. 44 -> 12.
+ *
+ * It has to reproduce two things `chamferBox` does and `plainBox` does not, or
+ * this is a different-looking object rather than a decimation:
+ *
+ *  - the PLANAR object-space UV taken off the dominant face axis. A stock
+ *    BoxGeometry's 0..1 UV would stretch a whole texture across a 16 mm slat
+ *    wherever a palette samples mesh uv.
+ *  - a wear mask. `chamferBox` writes 0.06 on the faces and 1.0 on the chamfers
+ *    and corners, and that 1.0 is where a plank's bright worn edge comes from.
+ *    With no chamfer there is nowhere to put it, so the member gets one middling
+ *    value instead. That is the single real visual concession of `geoDetail`,
+ *    and it is why the field exists on the preset rather than being applied
+ *    everywhere. The downward-face grime/AO channels are reproduced exactly.
+ */
+function plainMember(sx, sy, sz) {
+  const g = new THREE.BoxGeometry(sx, sy, sz);
+  const p = g.getAttribute('position');
+  const n = g.getAttribute('normal');
+  const uv = g.getAttribute('uv');
+  const c = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    const ax = Math.abs(n.getX(i));
+    const ay = Math.abs(n.getY(i));
+    const az = Math.abs(n.getZ(i));
+    const dom = ax > ay ? (ax > az ? 0 : 2) : ay > az ? 1 : 2;
+    const x = p.getX(i);
+    const y = p.getY(i);
+    const z = p.getZ(i);
+    uv.setXY(i, dom === 0 ? z : x, dom === 1 ? z : y);
+    c[i * 3] = 0.35;
+    if (n.getY(i) < -0.5) c[i * 3 + 1] = 0.35;
+    if (n.getY(i) < -0.4) c[i * 3 + 2] = 0.35;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  return g;
+}
+
 /** Part accumulator for one prop. */
 class PB {
   constructor() {
@@ -80,17 +136,25 @@ class PB {
   }
 
   box(sx, sy, sz, x = 0, y = 0, z = 0, o = {}) {
-    const g = chamferBox(sx, sy, sz, o.bevel ?? 0.008);
+    const g =
+      DETAIL < 1 && Math.min(sx, sy, sz) <= THIN
+        ? plainMember(sx, sy, sz)
+        : chamferBox(sx, sy, sz, o.bevel ?? 0.008);
     g.applyMatrix4(mat(x, y, z, o.ry ?? 0, o.rx ?? 0, o.rz ?? 0));
     return this._push(g, o.wear ?? 1, o.grime ?? 0, o.ao ?? 0);
   }
 
   cyl(r, h, x = 0, y = 0, z = 0, o = {}) {
+    const radial = o.radial ?? 12;
     const g = new THREE.CylinderGeometry(
       (o.taper ?? 1) * r,
       r,
       h,
-      o.radial ?? 12,
+      // Two thirds of the segments, floored at 6 (a hexagon still reads as
+      // round at prop scale) and clamped so it can never go UP: several
+      // generators already ask for 5 or 6 and the reduction must not add to
+      // them.
+      DETAIL < 1 ? Math.min(radial, Math.max(6, Math.round(radial * 0.66))) : radial,
       o.seg ?? 1,
       o.open ?? false
     );
@@ -233,6 +297,7 @@ function sandbag(rng, i = 0) {
     variant: i % 3,
     box: 4.6 - (i % 3) * 0.5,
     lump: 1.2,
+    detail: DETAIL,
   });
   const bb = g.boundingBox;
   paintMasks(g, (x, y, z, nx, ny, nz, out) => {
@@ -318,7 +383,17 @@ function tyre(rng, r = 0.33) {
   // 5 columns per block (block x3 / shoulder / groove). At 3 columns the groove
   // was a third of the pitch and the crown read as a ring of beads rather than
   // as tread; the extra segments also kill the faceting on the shoulder.
-  const radial = BLOCKS * 5;
+  /**
+   * At reduced detail, 4 columns per block instead of 5 — 2 380 -> 1 904
+   * triangles on the most expensive prop in the level (115 instances at
+   * `mobile`). NOT 3, and the comment above is why: the block is a trapezoid
+   * that is at full height across 47 % of the pitch, so with 3 samples per
+   * block either 1 or 2 of them land on the crown depending on `stagger`'s
+   * phase — the tread would come out UNEVEN around the tyre, which is worse
+   * than the beading the author measured. With 4, at least one column is always
+   * fully raised and a groove column survives on each side.
+   */
+  const radial = BLOCKS * (DETAIL < 1 ? 4 : 5);
   const HW = r * 0.3; // half the section width
   // A real tyre section: flat-ish sidewalls at the widest point, a distinct
   // shoulder, a flat crown, and a bead that leaves a proper hole in the middle.
@@ -682,6 +757,21 @@ function dustSkirt(rng) {
   }
   g.setAttribute('color', new THREE.BufferAttribute(col, 3));
   g.computeVertexNormals();
+  /**
+   * Drop the cylinder wall. THE CYLINDER IS ZERO HIGH: all five of its rings sit
+   * at y=0 with the same radius, so a column of wall vertices is five copies of
+   * one point and every one of the 208 wall triangles has two coincident
+   * vertices. Measured over the whole prop cloud, the largest area among them is
+   * *exactly* 0 m^2 — they rasterise nothing. The mound is the two 26-triangle
+   * caps and always was.
+   *
+   * 260 -> 52 triangles on 332 instances, i.e. 69 056 triangles a frame at
+   * `mobile`, and it cannot move a pixel: the surviving index run and every
+   * vertex it references are untouched.
+   */
+  const wall = SEG * RAD * 6;
+  const idx = g.getIndex().array;
+  g.setIndex(Array.from(idx.subarray(wall)));
   return g;
 }
 
@@ -901,6 +991,7 @@ export function burntCar(rng) {
  * Prototype ids are the vocabulary dressing.js and interiors.js draw from.
  */
 export function registerProps(A, rngIn) {
+  DETAIL = A.geoDetail ?? 1;
   const rng = rngIn;
   const P = (id, key, geo, opts = {}) => A.proto(id, { geo, key, ...opts });
   /**

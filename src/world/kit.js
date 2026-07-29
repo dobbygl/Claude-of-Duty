@@ -294,20 +294,33 @@ export function windowUnit(A, pm, o, rng, opts = {}) {
     }
   }
 
-  // stone sill, protruding and dripping dirt
+  /**
+   * Stone sill, protruding and dripping dirt, and the lintel over it.
+   *
+   * These two are the single biggest thing `geoDetail` buys in the STATIC
+   * batch: there are ~450 windows in the level and both are chamfer boxes, so
+   * 900 x 44 triangles. Dropping to the 12-triangle box is −28 800 triangles of
+   * scene, and because the static batch is submitted by the prepass, the main
+   * pass and every cascade, that is about −100 k a frame. What is given up is a
+   * 3 cm / 1.2 cm chamfer on a ledge seen from at least a few metres away.
+   */
+  const plainTrim = A.geoDetail < 1;
   if (opts.sill !== false) {
     A.add(
       'concrete',
-      BOX_SOFT(A),
+      plainTrim ? BOX_THIN(A) : BOX_SOFT(A),
       LL(pm, x, y - h / 2 - 0.045, -0.045, 0, w + 0.26, 0.09, t * 0.55),
       { masks: [0.5, 0.35, 0.2] }
     );
   }
   // lintel
   if (opts.lintel !== false) {
-    A.add('concrete', BOX(A), LL(pm, x, y + h / 2 + 0.055, 0.02, 0, w + 0.18, 0.11, t * 0.42), {
-      masks: [0.35, 0.5, 0.3],
-    });
+    A.add(
+      'concrete',
+      plainTrim ? BOX_THIN(A) : BOX(A),
+      LL(pm, x, y + h / 2 + 0.055, 0.02, 0, w + 0.18, 0.11, t * 0.42),
+      { masks: [0.35, 0.5, 0.3] }
+    );
   }
 
   // metal grille on some ground-floor windows
@@ -334,8 +347,10 @@ export function windowUnit(A, pm, o, rng, opts = {}) {
   if (opts.shutters) {
     const key = opts.shutterKey ?? 'metal_blue';
     const sw = w / 2 - 0.01;
-    const louvre = A.cache(`shutter:${sw.toFixed(2)}:${h.toFixed(2)}`, () =>
-      shutterLeaf(sw, h - 0.03)
+    // The detail tier is part of the cache key: two leaves of the same size at
+    // different tiers are different geometry.
+    const louvre = A.cache(`shutter:${sw.toFixed(2)}:${h.toFixed(2)}:${A.geoDetail}`, () =>
+      shutterLeaf(sw, h - 0.03, A.geoDetail)
     );
     // `state:'shuttered'` means shut for the afternoon — both leaves flat on the
     // reveal, which is a completely different silhouette from a half-open pair.
@@ -422,7 +437,7 @@ function sashLeaf(w, h) {
 }
 
 /** A louvred shutter leaf: stiles, rails and slats. Origin at leaf centre. */
-function shutterLeaf(w, h) {
+function shutterLeaf(w, h, detail = 1) {
   const parts = [];
   const push = (sx, sy, sz, x, y, z, rx = 0) => {
     const g = plainBox();
@@ -441,7 +456,10 @@ function shutterLeaf(w, h) {
   push(w, 0.05, 0.035, 0, h / 2 - 0.025, 0);
   push(w, 0.05, 0.035, 0, -h / 2 + 0.025, 0);
   push(w, 0.05, 0.035, 0, 0, 0);
-  const slats = Math.max(4, Math.floor((h - 0.16) / 0.115));
+  // 21 cm pitch instead of 11.5 at reduced detail: about half the louvres. A
+  // shutter across the street is ~15 px tall in `mobile`'s internal buffer, so
+  // what it needs is the light/dark banding, not the count.
+  const slats = Math.max(4, Math.floor((h - 0.16) / (detail < 1 ? 0.21 : 0.115)));
   for (let i = 0; i < slats; i++) {
     const y = -h / 2 + 0.09 + (i / (slats - 1)) * (h - 0.18);
     if (Math.abs(y) < 0.04) continue;

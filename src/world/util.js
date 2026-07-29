@@ -1030,8 +1030,22 @@ export function catenaryTube(from, to, sagAmt, radius, opts = {}) {
  * of cover in the level read at the wrong scale.
  */
 export function sackGeometry(rng, w = 0.5, h = 0.17, d = 0.3, opts = {}) {
-  const { variant = 0, box = 3.1, lump = 1 } = opts;
-  const g = new THREE.SphereGeometry(0.5, 20, 12);
+  const { variant = 0, box = 3.1, lump = 1, detail = 1 } = opts;
+  /**
+   * The sphere is only a parameterisation: it is immediately pushed onto an
+   * Lp-ball with an exponent of 4.1-4.6, so the finished bag is a rounded BRICK
+   * and most of the tessellation is spent describing flat faces. 16x10 drops
+   * 35 % of the triangles for 20 % of the angular resolution — and sandbags are
+   * the biggest prop group in the level (426 instances, 187 k triangles at
+   * `mobile` before this). 14x8 would save another 134 k a frame; it is not
+   * taken because a sandbag is COVER, so the player crouches at 1.5 m from one,
+   * where it spans ~48 px of `mobile`'s internal buffer and the tied ends would
+   * start to facet.
+   */
+  const g =
+    detail < 1
+      ? new THREE.SphereGeometry(0.5, 16, 10) // 288 tris
+      : new THREE.SphereGeometry(0.5, 20, 12); // 440 tris
   const pa = g.getAttribute('position');
   const seed = rng.float() * 50;
   for (let i = 0; i < pa.count; i++) {

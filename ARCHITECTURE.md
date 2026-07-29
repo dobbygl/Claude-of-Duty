@@ -234,8 +234,8 @@ dropped: the cascade COUNT (`OW_CASCADES` is a define in the material-patch
 chunk *and* in the sky's volumetric march), the shadow tap tier
 (`OW_PCF_TAPS` / `OW_PCSS`), `lightSlots`, and everything a subsystem bakes into
 geometry, textures or the fixed step at boot — `textureScale`,
-`simpleMaterials`, `propDensity`, `drawDistance`, `physicsHz`, the particle and
-decal budgets, `anisotropy`. `RenderSystem` therefore keeps two tiers: `qLevel`
+`simpleMaterials`, `propDensity`, `geoDetail`, `drawDistance`, `physicsHz`, the
+particle and decal budgets, `anisotropy`. `RenderSystem` therefore keeps two tiers: `qLevel`
 follows the live preset and gates which effect OBJECTS exist, while
 `shaderTier` is frozen at boot and gates what is compiled INTO a lit material.
 

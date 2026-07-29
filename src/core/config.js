@@ -47,6 +47,16 @@ export const UNITS = {
  *   propDensity    fraction of OPTIONAL scatter instances to keep, 0..1.
  *                  Only prototypes flagged `optional` in props.js are thinned,
  *                  and none of them carries collision — see Assembler.place().
+ *   geoDetail      geometry detail tier for the world's own generators, 1 =
+ *                  full. Below 1, a thin member loses its chamfer (44 -> 12
+ *                  triangles), cylinders and lathes lose segments, and the
+ *                  window sill/lintel/shutter kit drops to its cheap form.
+ *                  It is the complement of `propDensity`: that one removes
+ *                  whole instances, this one makes the instance cheaper — so it
+ *                  is the knob for the props that are NOT optional, which is
+ *                  where the triangles actually are (two tyres and three crates
+ *                  were 27 % of the prop cloud). Consumes no rng, so the level
+ *                  it builds is bit-identical whatever the tier.
  *   textureScale   procedural bake resolution multiplier (1 = 1K reference).
  *   simpleMaterials  drop POM, triplanar, de-tiling and the macro relief /
  *                  big-band layers out of every world material.
@@ -84,6 +94,7 @@ export const QUALITY_PRESETS = {
     drawDistance: 55,
     lodBias: 0.55,
     propDensity: 0.5,
+    geoDetail: 0.5,
     textureScale: 0.25,
     simpleMaterials: true,
     lightSlots: 8,
@@ -110,6 +121,7 @@ export const QUALITY_PRESETS = {
     drawDistance: 0,
     lodBias: 1,
     propDensity: 1,
+    geoDetail: 1,
     textureScale: 0.5,
     simpleMaterials: false,
     lightSlots: 20,
@@ -136,6 +148,7 @@ export const QUALITY_PRESETS = {
     drawDistance: 0,
     lodBias: 1,
     propDensity: 1,
+    geoDetail: 1,
     textureScale: 0.75,
     simpleMaterials: false,
     lightSlots: 20,
@@ -162,6 +175,7 @@ export const QUALITY_PRESETS = {
     drawDistance: 0,
     lodBias: 1,
     propDensity: 1,
+    geoDetail: 1,
     textureScale: 1,
     simpleMaterials: false,
     lightSlots: 20,
@@ -188,6 +202,7 @@ export const QUALITY_PRESETS = {
     drawDistance: 0,
     lodBias: 1,
     propDensity: 1,
+    geoDetail: 1,
     textureScale: 1,
     simpleMaterials: false,
     lightSlots: 20,

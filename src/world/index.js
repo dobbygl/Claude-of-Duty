@@ -134,6 +134,7 @@ export class WorldSystem {
       drawDistance: q.drawDistance ?? 0,
       lodBias: q.lodBias ?? 1,
       propDensity: q.propDensity ?? 1,
+      geoDetail: q.geoDetail ?? 1,
     });
     this.A = A;
     A.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
