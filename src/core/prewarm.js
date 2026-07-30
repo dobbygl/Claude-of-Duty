@@ -260,16 +260,38 @@ export async function prewarm(engine, { onProgress = () => {}, transients = fals
       if (SELF_WARMING.has(sys.constructor?.id)) continue;
       if (typeof sys.prewarmMaterials === 'function') hooks.push(sys);
     }
+    // THE HOOKS NEED THE SAME BOUND TARGET PASS 1 HAD, and this is where the
+    // boot seconds actually are.
+    //
+    // three folds `outputColorSpace` and `toneMapping` into the program cache
+    // key and reads both off the CURRENTLY BOUND target — the reason `compile()`
+    // above binds `scratchRt`. But `compile()` restores the previous target in
+    // its own `finally`, so by the time this loop runs the CANVAS is bound again
+    // and every hook compiled the `srgb` + tone-mapped variant of programs that
+    // pass 1 had already made in `srgb-linear` + NoToneMapping. The world and the
+    // viewmodel are both drawn into HDR targets, so the canvas twins are never
+    // used by a single frame.
+    //
+    // Measured headless at `q=mobile`, same serial-compile regime as the phone
+    // (`parallel: false`): prewarm compiles 114 -> 77, and `render`'s own hook
+    // 43 -> 6, i.e. 37 of its 43 were pure colour-space duplicates. Programs
+    // compiled AFTER prewarm went 6 -> 2, so nothing is deferred into gameplay.
+    // At the ~76 ms/compile the Mali-G78 pays, that is ~2.8 s off a 25 s boot.
+    renderer.setRenderTarget(scratchRt);
     const hookResults = {};
-    for (const sys of hooks) {
-      const id = sys.constructor?.id ?? '?';
-      try {
-        const arg = sys === renderSys ? { post: true, shadow: RENDER_SHADOW_WARM } : engine.ctx;
-        hookResults[id] = (await sys.prewarmMaterials(arg)) ?? { ok: true };
-      } catch (err) {
-        // An optional hook must never be able to block boot.
-        hookResults[id] = { ok: false, reason: String(err?.message ?? err) };
+    try {
+      for (const sys of hooks) {
+        const id = sys.constructor?.id ?? '?';
+        try {
+          const arg = sys === renderSys ? { post: true, shadow: RENDER_SHADOW_WARM } : engine.ctx;
+          hookResults[id] = (await sys.prewarmMaterials(arg)) ?? { ok: true };
+        } catch (err) {
+          // An optional hook must never be able to block boot.
+          hookResults[id] = { ok: false, reason: String(err?.message ?? err) };
+        }
       }
+    } finally {
+      renderer.setRenderTarget(prevRt, prevFace, prevMip);
     }
     engine.__prewarmHooks = hookResults;
 
