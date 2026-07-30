@@ -1,0 +1,19 @@
+{
+  "name": "OVERWATCH \u2014 Tactical Shooter",
+  "short_name": "OVERWATCH",
+  "description": "A browser FPS whose every texture, mesh, animation and sound is generated procedurally at load time. Runs fully offline.",
+  "start_url": "./",
+  "scope": "./",
+  "id": "./",
+  "display": "fullscreen",
+  "display_override": [
+    "fullscreen",
+    "standalone"
+  ],
+  "orientation": "landscape",
+  "background_color": "#05080b",
+  "theme_color": "#05080b",
+  "categories": [
+    "games"
+  ]
+}

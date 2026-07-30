@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- maximum-scale / user-scalable: pinch-zoom and the iOS double-tap zoom are
+         never intentional on a game surface, and both fire mid-firefight from a
+         thumb that missed a button. viewport-fit=cover puts the canvas under the
+         notch, which is where the safe-area padding of the HUD expects it. -->
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#05080b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <title>OVERWATCH — Tactical Shooter</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 100%; height: 100%; overflow: hidden; background: #000;
+        /* A game surface must never scroll, rubber-band, pinch-zoom, select text
+           or flash a tap highlight. `touch-action: none` also removes the 300 ms
+           click delay that a zoomable viewport still costs on some browsers. */
+        touch-action: none;
+        overscroll-behavior: none;
+        -webkit-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+      }
+      body { font-family: "Inter", "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+      #game { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: none; }
+      #ui { touch-action: none; overscroll-behavior: none; }
+
+      /* ---------------------------------------------------------------- boot
+         Nothing here is downloaded: every texture, mesh, animation and sound is
+         synthesised at load time, which is 2-4 s on a desktop and an estimated
+         15-40 s on a phone. Without this the whole of that is a black screen with
+         no indication the page is alive, and a phone user closes the tab. It is
+         plain markup in the document so it paints on the FIRST frame, before the
+         module graph has even been fetched, and src/main.js removes it the moment
+         __READY__ goes up (and on a boot failure). ------------------------- */
+      #ow-boot {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 14px; padding: 24px;
+        background: #05080b; color: #eef4f7; text-align: center;
+        letter-spacing: .06em; text-transform: uppercase;
+        font-family: "Avenir Next Condensed","DIN Alternate","Roboto Condensed","Arial Narrow","Helvetica Neue",Inter,system-ui,sans-serif;
+        font-weight: 600;
+      }
+      #ow-boot .t { font-size: clamp(26px, 6vmin, 54px); font-weight: 700; letter-spacing: .34em; }
+      #ow-boot .s { font-size: clamp(9px, 1.6vmin, 13px); letter-spacing: .3em; color: #ffb02a; }
+      #ow-boot .bar { width: min(320px, 62vw); height: 2px; background: rgba(255,255,255,.14); overflow: hidden; }
+      #ow-boot .bar > i { display: block; width: 38%; height: 100%; background: #ffb02a;
+        animation: ow-boot-slide 1.35s ease-in-out infinite; }
+      @keyframes ow-boot-slide {
+        from { transform: translateX(-110%); }
+        to   { transform: translateX(360%); }
+      }
+      #ow-boot .n {
+        font-size: clamp(8px, 1.4vmin, 11px); letter-spacing: .16em; line-height: 1.8;
+        color: rgba(196,210,219,.45); text-transform: none; max-width: 46ch;
+      }
+    </style>
+    <script type="module" crossorigin src="./assets/index-CTAxv7lR.js"></script>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div id="ui"></div>
+    <div id="ow-boot">
+      <div class="t">OVERWATCH</div>
+      <div class="s">Generating world</div>
+      <div class="bar"><i></i></div>
+      <div class="n">
+        Every texture, mesh, animation and sound in this game is generated from
+        scratch in your browser — nothing is downloaded. First load takes a few
+        seconds on a desktop and up to about 40 on a phone.
+      </div>
+    </div>
+  </body>
+</html>
