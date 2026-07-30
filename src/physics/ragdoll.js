@@ -196,6 +196,8 @@ export class Ragdoll {
       this._initUp(i);
     }
 
+    this._buildAttachments();
+
     // skeleton binding (filled by adoptSkeleton)
     this.bones3D = null;
     this.boneBind = null;
@@ -264,6 +266,102 @@ export class Ragdoll {
       }
     }
     return Int32Array.from(pairs);
+  }
+
+  /**
+   * Limb roots that are NOT shared particles, and therefore had nothing holding
+   * them to the parent at all.
+   *
+   * Particles are deduplicated by position rounded to the millimetre, so a bone
+   * whose head lands exactly on its parent's head or tail shares that particle
+   * and the parent's own length constraint carries it. Anything else gets its
+   * own particle — and `_solveDistance` only ties a bone to ITSELF while
+   * `_solveCones` only rotates the child's free end, so nothing tied the two
+   * bones together. Measured on `humanoidSpec(1.8)`: four such roots, both
+   * upperArms hanging off the side of the chest and both thighs off the side of
+   * the pelvis. Shoulders and hips separated by up to a couple of metres and the
+   * doll then went to sleep in that pose, freezing the defect on screen.
+   *
+   * Each one is recorded as a socket: the parameter `s` along the parent bone it
+   * hangs from, and the distance it hangs at in the bind pose.
+   */
+  _buildAttachments() {
+    const bone = [], param = [], len = [];
+    for (let i = 0; i < this.boneCount; i++) {
+      const p = this.boneParent[i];
+      if (p < 0) continue;
+      const x = this.boneHead[i];
+      if (x === this.boneHead[p] || x === this.boneTail[p]) continue;
+      const pa = this.boneHead[p], pc = this.boneTail[p];
+      const ex = this.px[pc] - this.px[pa];
+      const ey = this.py[pc] - this.py[pa];
+      const ez = this.pz[pc] - this.pz[pa];
+      const e2 = ex * ex + ey * ey + ez * ez;
+      let s = 0;
+      if (e2 > 1e-12) {
+        s =
+          ((this.px[x] - this.px[pa]) * ex +
+            (this.py[x] - this.py[pa]) * ey +
+            (this.pz[x] - this.pz[pa]) * ez) / e2;
+        if (s < 0) s = 0;
+        else if (s > 1) s = 1;
+      }
+      bone.push(i);
+      param.push(s);
+      len.push(
+        Math.hypot(
+          this.px[x] - (this.px[pa] + ex * s),
+          this.py[x] - (this.py[pa] + ey * s),
+          this.pz[x] - (this.pz[pa] + ez * s)
+        )
+      );
+    }
+    this.attachBone = Int32Array.from(bone);
+    this.attachParam = Float64Array.from(param);
+    this.attachLen = Float64Array.from(len);
+  }
+
+  /**
+   * Socket constraint for those roots. Holds the child's head at its bind
+   * distance from a fixed point along the parent bone, mass-weighted exactly
+   * like `_solveDistance`: the parent point's inverse mass is the usual PBD
+   * segment blend (1-s)^2*wHead + s^2*wTail, and the correction is split back
+   * onto the two parent particles by (1-s) and s.
+   */
+  _solveAttach() {
+    const att = this.attachBone;
+    for (let k = 0; k < att.length; k++) {
+      const i = att[k];
+      const p = this.boneParent[i];
+      const x = this.boneHead[i];
+      const pa = this.boneHead[p], pc = this.boneTail[p];
+      const s = this.attachParam[k];
+      const u = 1 - s;
+      const wx = this.invMass[x];
+      const wa = this.invMass[pa], wc = this.invMass[pc];
+      const w = wx + u * u * wa + s * s * wc;
+      if (w === 0) continue;
+      const qx = this.px[pa] + (this.px[pc] - this.px[pa]) * s;
+      const qy = this.py[pa] + (this.py[pc] - this.py[pa]) * s;
+      const qz = this.pz[pa] + (this.pz[pc] - this.pz[pa]) * s;
+      const dx = this.px[x] - qx;
+      const dy = this.py[x] - qy;
+      const dz = this.pz[x] - qz;
+      const d = Math.hypot(dx, dy, dz);
+      if (d < 1e-9) continue;
+      const diff = (d - this.attachLen[k]) / d / w;
+      this.px[x] -= dx * diff * wx;
+      this.py[x] -= dy * diff * wx;
+      this.pz[x] -= dz * diff * wx;
+      const ka = diff * wa * u;
+      this.px[pa] += dx * ka;
+      this.py[pa] += dy * ka;
+      this.pz[pa] += dz * ka;
+      const kc = diff * wc * s;
+      this.px[pc] += dx * kc;
+      this.py[pc] += dy * kc;
+      this.pz[pc] += dz * kc;
+    }
   }
 
   _initUp(i) {
@@ -365,6 +463,7 @@ export class Ragdoll {
     this._gatherCandidates();
     for (let it = 0; it < iters; it++) {
       this._solveDistance();
+      this._solveAttach();
       this._solveCones();
       this._buildContacts();
       this._solveContacts(it === iters - 1);
