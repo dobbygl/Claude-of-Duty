@@ -98,6 +98,8 @@ export class GroundShadows {
     this._pos = new THREE.Vector3();
     this._scale = new THREE.Vector3(1, 1, 1);
     this._foot = new THREE.Vector3();
+    /** FEET resolved to rig indices on first use — see `addActor`. */
+    this._feetIdx = null;
     // lie-flat rotation, built once: the per-frame path must never allocate
     this._flat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
     this._nBody = 0;
@@ -156,10 +158,18 @@ export class GroundShadows {
       this._place(this.body, this._nBody++, p.x, p.y, p.z, 0.44 * scale * crouch, 0.34 * scale * crouch, agent.yaw);
     }
     const an = agent.animator;
-    if (!an?.bonePos) return;
-    for (const name of FEET) {
+    if (!an?.bonePosAt || !an.rig) return;
+    // `bonePos(name, …)` resolves the name through `rig.index()`, a Map lookup
+    // on a string key, twice per actor per frame. The rig is a shared singleton
+    // so those two indices are constants — resolve them once, exactly as
+    // agent.js already does for the hitbox bone names.
+    if (this._feetIdx === null) this._feetIdx = FEET.map((n) => an.rig.index(n));
+    // `fi`, not `k`: the body below already declares `const k` for the contact
+    // strength, and reading a loop variable named `k` above that declaration is
+    // a temporal-dead-zone throw, not a shadow.
+    for (let fi = 0; fi < this._feetIdx.length; fi++) {
       if (this._nFeet >= this.feet.instanceMatrix.count) break;
-      an.bonePos(name, this._foot);
+      an.bonePosAt(this._feetIdx[fi], this._foot);
       if (!Number.isFinite(this._foot.y)) continue;
       // A boot 6 cm off the floor still darkens it; at 35 cm it does not. The
       // contact shrinks rather than fading, which is what a real one does.
