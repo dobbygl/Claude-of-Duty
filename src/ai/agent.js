@@ -983,9 +983,23 @@ export class Agent {
       this.controller?.teleport(this.position.x, this.position.y, this.position.z);
     }
 
-    this.group.position.copy(this.position);
-    this.group.rotation.y = this.yaw;
-    this.group.updateMatrixWorld(true);
+    // Compose the GROUP's own world matrix only. The deep walk that used to be
+    // here refreshed all 25 bones and the mesh, and then `animator.update`
+    // immediately invalidated every bone local in `_writePose` and re-traversed
+    // the tree from `bones[0]` — so the walk was thrown away on every frame the
+    // animator ran. This is three's own compose, verbatim, and it has exactly
+    // the same dependency the deep version did: the parent's matrixWorld.
+    //
+    // On a frame where the animator is SKIPPED (the LOD branches at the bottom)
+    // nothing else refreshes the bones, and `syncHitboxes` / `ground.addActor`
+    // in lateUpdate read them — so those paths still do the deep walk.
+    const g = this.group;
+    g.position.copy(this.position);
+    g.rotation.y = this.yaw;
+    g.updateMatrix();
+    if (g.parent) g.matrixWorld.multiplyMatrices(g.parent.matrixWorld, g.matrix);
+    else g.matrixWorld.copy(g.matrix);
+    g.matrixWorldNeedsUpdate = false;
 
     const moving = this.speed > 0.25;
     let clip;
@@ -1018,6 +1032,7 @@ export class Agent {
     if (this.lodIrrelevant) {
       if (this._animSkip > 0) {
         this._animSkip--;
+        g.updateMatrixWorld(true); // the animator will not; see the note above
         return;
       }
       this._animSkip = 2; // one evaluation in three while nothing can see it
@@ -1028,6 +1043,7 @@ export class Agent {
       // which makes this branch unreachable there — see core/config.js.
       if (this._animSkip > 0) {
         this._animSkip--;
+        g.updateMatrixWorld(true); // the animator will not; see the note above
         return;
       }
       this._animSkip = 1; // one evaluation in two
