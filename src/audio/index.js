@@ -119,6 +119,8 @@ export class AudioSystem {
     this._offs = [];
     this._gestureHandler = null;
     this._ambienceApi = null;
+    /** In-flight `start()`, so a burst of gestures cannot stack contexts. */
+    this._starting = null;
   }
 
   /* ================================================================ */
@@ -133,9 +135,19 @@ export class AudioSystem {
     // Web Audio needs a user gesture. Arm every plausible one; the first to
     // land builds the graph. Capture mode never gestures, so shots render in
     // silence and stay byte-identical.
+    // NOT every armed event is an activation-triggering input event — `wheel`
+    // is not — so `resume()` can still be refused by the autoplay policy. This
+    // used to disarm the listeners BEFORE awaiting `start()`, so one scroll
+    // anywhere on the page before the first click consumed the only attempt,
+    // latched `failed`, and the session stayed silent with nothing able to
+    // retry. Stay armed until a start actually succeeds, and allow only one in
+    // flight so a burst of gestures cannot build two contexts.
     const kick = () => {
-      this._disarmGesture();
-      this.start().catch(() => {});
+      if (this._starting) return;
+      this._starting = this.start()
+        .then((started) => { if (started) this._disarmGesture(); })
+        .catch(() => { /* start() reports its own failures */ })
+        .finally(() => { this._starting = null; });
     };
     this._gestureHandler = kick;
     if (typeof addEventListener === 'function') {
@@ -146,7 +158,12 @@ export class AudioSystem {
 
   _disarmGesture() {
     if (!this._gestureHandler) return;
-    for (const ev of GESTURES) removeEventListener(ev, this._gestureHandler);
+    // Guarded exactly like the registration in `init`: in a worker or a Node
+    // realm there is no removeEventListener, and throwing here would abort
+    // `dispose()` before the event unsubscribes and the graph teardown.
+    if (typeof removeEventListener === 'function') {
+      for (const ev of GESTURES) removeEventListener(ev, this._gestureHandler);
+    }
     this._gestureHandler = null;
   }
 
@@ -171,7 +188,21 @@ export class AudioSystem {
       this.ambience.start();
       this.mixer.setSpace(this._space, 0.001);
 
-      if (actx.state === 'suspended') await actx.resume();
+      // A refused resume is NOT a failure of this subsystem: it means this
+      // particular gesture did not count as activation. Tear the graph down and
+      // report false with `failed` left CLEAR, so the next gesture gets a clean
+      // attempt. Only a real error — no AudioContext at all, a node the browser
+      // will not build — reaches the catch below and latches.
+      if (actx.state === 'suspended') {
+        try {
+          await actx.resume();
+        } catch { /* the autoplay policy refused this particular gesture */ }
+        if (actx.state === 'suspended') {
+          console.info('[audio] context still suspended, waiting for a real user gesture');
+          this._teardown();
+          return false;
+        }
+      }
       this.running = true;
       this.stats.started = true;
       this.stats.contextState = actx.state;
