@@ -107,6 +107,18 @@ for (const name of wanted) {
   }
 }
 
+// A per-shot `ok: false` used to be recorded and then ignored: `report.ok` was
+// only ever cleared by the catch below, so a run where `__APPLY_SHOT__` rejected
+// every name still exited 0 and left a directory the pixel gate would bless.
+// The empty case is called out separately because it is the one that produces a
+// directory rather than no directory, which is what makes it dangerous.
+if (report.shots.length === 0) {
+  report.ok = false;
+  report.fatal = 'no shots captured';
+} else if (!report.shots.every((s) => s.ok)) {
+  report.ok = false;
+}
+
 report.errors = report.shots.flatMap((s) => s.logs ?? []);
 await browser.close();
 if (server) server.kill();

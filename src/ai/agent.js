@@ -572,13 +572,13 @@ export class Agent {
     }
 
     // flank when the player has been static and we have friends shooting
-    if (
-      sq &&
-      this.stateTime > 4 &&
-      this.grenadeCooldown < 0 === false &&
-      sq.canFlank(this) &&
-      this.rng.float() < dt * 0.25
-    ) {
+    // The grenade cooldown used to gate this, as `grenadeCooldown < 0 === false`
+    // — which parses as `(grenadeCooldown < 0) === false`, i.e. "cooldown >= 0".
+    // It starts at 9-22 s (line 222) and is decremented every frame with nothing
+    // ever raising it except a throw, so within about 20 seconds of the match it
+    // is permanently negative and NO agent ever flanks again. Flanking has
+    // nothing to do with grenade supply; the term was never meant to be here.
+    if (sq && this.stateTime > 4 && sq.canFlank(this) && this.rng.float() < dt * 0.25) {
       const side = this.rng.float() < 0.5 ? 1 : -1;
       const perp = this._v.copy(target).sub(this.position).setY(0).normalize();
       const flank = this._v2
@@ -818,8 +818,12 @@ export class Agent {
   }
 
   _throwGrenade(target) {
+    // `hasGrenade = false` used to follow, and nothing anywhere set it back.
+    // One throw per actor per match made both rationing mechanisms dead code:
+    // the 16-34 s cooldown on the line above, and `Squad.requestGrenade`'s
+    // squad-wide 14-26 s budget. The cooldown IS the ration; `hasGrenade` stays
+    // as the "this loadout carries grenades at all" flag it reads as.
     this.grenadeCooldown = this.rng.range(16, 34);
-    this.hasGrenade = false;
     const from = this._v.copy(this.animator.muzzleWorld);
     this.ai.throwGrenade(this, from, target);
   }

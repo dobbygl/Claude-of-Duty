@@ -133,6 +133,17 @@ try {
   if (server) server.kill();
 }
 
+// An unknown shot name, or a shot `__APPLY_SHOT__` refused, was pushed as a row
+// with `ok: false` and then never consulted — `report.ok` was only cleared by
+// the catch above, so the process exited 0 and the caller saw a successful
+// capture of a set that was never taken.
+if (report.shots.length === 0) {
+  report.ok = false;
+  report.fatal = report.fatal ?? 'no shots captured';
+} else if (!report.shots.every((s) => s.ok)) {
+  report.ok = false;
+}
+
 writeFileSync(`${OUTDIR}/report.json`, JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));
 if (!report.ok) process.exit(1);

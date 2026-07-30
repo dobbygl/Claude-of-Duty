@@ -20,9 +20,44 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 const A = resolve(args.a), B = resolve(args.b);
 const TOL = Number(args.tol ?? 0);
 
-const names = readdirSync(A).filter((f) => f.endsWith('.png')).sort();
+/**
+ * `*.diff.png` is this tool's OWN output, written into B by `--write-diff`.
+ * Left in the listing it compares a diff overlay against a missing file on the
+ * next run, which reports a failure that is not a regression.
+ */
+const shotsIn = (dir) =>
+  readdirSync(dir).filter((f) => f.endsWith('.png') && !f.endsWith('.diff.png')).sort();
+
+const names = shotsIn(A);
+const inB = new Set(shotsIn(B));
 const rows = [];
 let worst = null;
+
+/**
+ * A comparison of NOTHING is not a pass.
+ *
+ * `rows.every()` is vacuously true on an empty list, so with no PNGs in A this
+ * printed `identical: true` and exited 0 — certifying any change at all. It is
+ * reachable rather than theoretical: `tools/baseline.mjs` creates its output
+ * directory before the capture loop and catches each shot's failure
+ * individually, so a run where every shot throws leaves an existing-but-empty
+ * directory, and the next gate blesses whatever comes after it.
+ */
+if (names.length === 0) {
+  console.log(JSON.stringify({
+    a: A, b: B, tol: TOL, identical: false, withinEpsilon: false,
+    fatal: `no .png shots in --a=${A}; a comparison of nothing is not a pass`,
+    worst: null, rows: [],
+  }, null, 2));
+  process.exit(1);
+}
+
+// A shot that exists only in B was never compared by anything: the loop below
+// is driven by A's listing. Silently ignoring it means a capture that GAINED a
+// shot reports a clean gate on a set it never looked at.
+for (const n of inB) {
+  if (!names.includes(n)) rows.push({ shot: n, status: 'MISSING_IN_A' });
+}
 
 for (const n of names) {
   const pb = join(B, n);
@@ -60,7 +95,13 @@ for (const n of names) {
   if (!worst || pct > worst.changedPct) worst = row;
 }
 
-const identical = rows.every((r) => r.changedPct === 0);
-const clean = rows.every((r) => (r.changedPct ?? 100) < 0.05 && (r.maxDelta ?? 255) <= Math.max(2, TOL));
-console.log(JSON.stringify({ a: A, b: B, tol: TOL, identical, withinEpsilon: clean, worst, rows }, null, 2));
+// `compared` is reported so a reader can tell "all five shots matched" from
+// "nothing was looked at" without counting rows by eye — the distinction this
+// tool used to collapse.
+const compared = rows.filter((r) => r.changedPct !== undefined).length;
+const identical = compared > 0 && rows.every((r) => r.changedPct === 0);
+const clean =
+  compared > 0 &&
+  rows.every((r) => (r.changedPct ?? 100) < 0.05 && (r.maxDelta ?? 255) <= Math.max(2, TOL));
+console.log(JSON.stringify({ a: A, b: B, tol: TOL, compared, identical, withinEpsilon: clean, worst, rows }, null, 2));
 process.exit(clean ? 0 : 1);

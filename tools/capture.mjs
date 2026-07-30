@@ -27,7 +27,14 @@ const args = Object.fromEntries(
 const PORT = Number(args.port ?? 5173);
 const W = Number(args.w ?? 1920);
 const H = Number(args.h ?? 1080);
-const SHOT = args.shot ?? 'default';
+/**
+ * `hero`, not `default`: there has never been a shot called `default` in
+ * `SHOTS` (hero, interior, detail, sunset, night, weapon, ads, muzzle, combat,
+ * impacts, hud). `__APPLY_SHOT__` returned `{error: 'unknown shot "default"'}`,
+ * this driver logged it and photographed anyway — so a bare `npm run shot` was
+ * capturing wherever the free-running camera happened to be pointing.
+ */
+const SHOT = args.shot ?? 'hero';
 const OUT = resolve(args.out ?? `shots/${SHOT}.png`);
 const TIMEOUT = Number(args.timeout ?? 90000);
 // Frames to render before capture: lets TAA converge, streaming settle, LOD pick.
@@ -106,6 +113,13 @@ try {
       { s: SHOT, settle: SETTLE }
     );
     logs.push(`[shot] ${JSON.stringify(applied)}`);
+    // Refusing to photograph is the point: a screenshot of the wrong camera is
+    // worse than no screenshot, because it looks like a result.
+    if (applied?.error) {
+      throw new Error(
+        `${applied.error}${applied.available ? ` — available: ${applied.available.join(', ')}` : ''}`
+      );
+    }
 
     // Pump deterministic frames so temporal effects converge.
     await page.evaluate(

@@ -41,6 +41,18 @@ const FRAMES = Number(args.frames ?? 1200);
 const TIME_OF_DAY = args.time !== undefined ? Number(args.time) : 17.4;
 const OUT = resolve(args.out ?? 'demo/overwatch-demo.mp4');
 const TMP = resolve(args.tmp ?? '.tmp-demo');
+// `--tmp` names a path this script deletes RECURSIVELY AND FORCED, in two
+// places (before recording, and on cleanup unless `--keep`). Nothing validated
+// it, so `--tmp=.` took the working tree and `.git` with it, and `--tmp=$HOME`
+// rather more. Constrain it to a directory directly inside the repo, which is
+// the only thing a scratch directory ever needs to be.
+{
+  const repoRoot = resolve(import.meta.dirname, '..');
+  if (dirname(TMP) !== repoRoot) {
+    console.error(`refusing --tmp=${TMP}: it must be a directory directly inside ${repoRoot}`);
+    process.exit(1);
+  }
+}
 const QUALITY = Number(args.jpeg ?? 94);
 
 const log = (...m) => console.log(...m);
